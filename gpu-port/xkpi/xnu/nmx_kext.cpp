@@ -535,6 +535,7 @@ void NMXGPU::attachNow()
     }
     nmx_marker_write(true);
     nmx_step("attach: start");
+    IOLog("NullMoth GPU: driver built " __DATE__ " " __TIME__ " (b213+)\n");   /* b213: which build is really loaded */
     {
         /* diagnostic build: DRM debug messages are opt-in (boot-arg nmxdrm=<mask>, e.g. 22 = driver+KMS+atomic) */
         uint32_t dbg = 0;

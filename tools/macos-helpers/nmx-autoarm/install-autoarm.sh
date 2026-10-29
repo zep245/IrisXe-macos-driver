@@ -14,7 +14,7 @@ cp "$HERE/nmx-autoarm.sh" "$S" && chmod 755 "$S" && chown root:wheel "$S"
 cp "$HERE/com.nullmoth.autoarm.plist" "$P" && chmod 644 "$P" && chown root:wheel "$P"
 xattr -d com.apple.quarantine "$S" "$P" 2>/dev/null
 plutil -lint "$P" >/dev/null || { echo "plist broken"; exit 1; }
-echo "installed (v11): $P -> $S"
+echo "installed (v12): $P -> $S"
 # b135: the login brightness sync (Control Center's slider follows the panel after a restart) comes with it
 if [ -x "$BS/install-brightsync.sh" ]; then "$BS/install-brightsync.sh"; else echo "note: nmx-brightsync folder not found next to this one - brightness slider sync not installed"; fi
 echo "It acts only when the boot-args contain nmxws=1 AND nmxautoarm=1, 2 or 3:"

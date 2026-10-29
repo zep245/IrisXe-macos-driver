@@ -165,6 +165,7 @@ Files in `/Library/GPUBundles/` (read at run time, no rebuild):
 | `nvmtl-iconcpu` | Tahoe: draw app icons on the CPU (the fallback before b211; slower) |
 | `nvmtl-icontest` | Tahoe: icon test mode with captures (use `nmx-icontest.sh`) |
 | `nvmtl-nolumswizzle` | Turn off the luminance swizzle for one-channel (LA08 / L008) surfaces |
+| `nvmtl-nopcache` | No on-disk pipeline cache (b214; compiled GPU programs are kept per process in the user cache folder) |
 
 ## Diagnostics
 

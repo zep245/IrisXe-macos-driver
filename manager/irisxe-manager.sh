@@ -104,7 +104,7 @@ install_kext() {   # $1 source kext, $2 name
     rm -rf "$d" && ditto "$s" "$d" || { say "  ERROR: copy failed"; return 1; }
     chown -R root:wheel "$d"; chmod -R 755 "$d"; xattr -dr com.apple.quarantine "$d" 2>/dev/null
     say "  $n.kext installed - macOS adds it at the next restart (approve it in Privacy & Security if asked)"
-    KEXTS_CHANGED=1
+    KEXTS_CHANGED=1; CHANGED_KEXTS="$CHANGED_KEXTS $2"
 }
 install_plugin_binary() {   # quiet plugin: replace only the binary (+Info.plist), keep air-runtime/ (nmx-plugin-update.sh)
     local s=$1 D="$GB/NVMTLDriver.bundle"
@@ -160,6 +160,15 @@ cmd_install() {
     done
     if [ "$KEXTS_CHANGED" = 1 ]; then
         touch "$EXT"
+        # b213: rebuild macOS's cached copy of third-party drivers (the auxiliary kext collection). Without it Sequoia kept
+        # running the build from before b190 although the new files were in /Library/Extensions (10-29: no SAGV line, the
+        # per-commit log lines still on).
+        # (kmutil install/create --update-all also rebuilds Apple's boot/system collections and needs a KDK - not that;
+        # kmutil load on each changed kext rebuilds only the auxiliary collection and stages it for the next boot)
+        say "updating macOS's driver cache (kmutil) - takes a minute"
+        for k in $CHANGED_KEXTS; do
+            say "  $k:"; kmutil load -p "$EXT/$k.kext" 2>&1 | tail -3 | sed 's/^/    /'
+        done
         say ""; say "Kexts changed: restart the Mac. If macOS says a system extension was blocked, open"
         say "System Settings -> Privacy & Security, click Allow, and restart again."
     fi

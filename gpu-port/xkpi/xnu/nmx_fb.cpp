@@ -51,6 +51,31 @@ class NMXBacklight : public IODisplayParameterHandler {
     IODisplay *fDisp = nullptr;
     thread_call_t fSync = nullptr;
     int fSyncLeft = 0;
+    /* b215 (10-29 video: after boot, or when the screen came back after dimming / display sleep, the panel was at full
+       brightness while the slider still showed the low level; the next brightness key fixed it). i915 lights the panel
+       at ITS OWN backlight level whenever it enables the panel (the boot hand-over mode set, DPMS on, resume) - it
+       never learns ours, because this handler writes the PWM duty register directly. A watch every 2 s: when the
+       panel is on and the duty register no longer holds our level, it is written again (and the first few logged). */
+    thread_call_t fWatch = nullptr;
+    unsigned fWatchFixes = 0;
+    static void watchFire(thread_call_param_t p, thread_call_param_t) {
+        NMXBacklight *me = (NMXBacklight *)p;
+        if (!me->fWatch) return;
+        if (me->fRegs && me->fPowered && me->fFreq && me->fPending < 0) {
+            const uint32_t want = me->dutyFor(me->fLevel);
+            const uint32_t freq = *(volatile uint32_t *)(me->fRegs + kBlcFreq);
+            const uint32_t duty = *(volatile uint32_t *)(me->fRegs + kBlcDuty);
+            if (duty != want || freq != me->fFreq) {
+                *(volatile uint32_t *)(me->fRegs + kBlcFreq) = me->fFreq;
+                *(volatile uint32_t *)(me->fRegs + kBlcDuty) = want;
+                if (me->fWatchFixes++ < 6)
+                    FBLOG("backlight: panel was at duty %u (freq %u) - set back to our %d%% (duty %u); i915 relit it at its own level",
+                          duty, freq, (int)me->fLevel, want);
+            }
+        }
+        thread_call_t w = me->fWatch;
+        if (w) { uint64_t dl; clock_interval_to_deadline(2000, kMillisecondScale, &dl); thread_call_enter_delayed(w, dl); }
+    }
     static void syncFire(thread_call_param_t p, thread_call_param_t) {
         NMXBacklight *me = (NMXBacklight *)p;
         IODisplay *d = me->fDisp;
@@ -139,6 +164,9 @@ public:
         h->fSave = thread_call_allocate(saveFire, h);
         h->fSync = thread_call_allocate(syncFire, h);
         if (!h->fApply) { h->release(); return nullptr; }
+        if (!PE_parse_boot_argn("-nmxnoblwatch", nullptr, 0) && (h->fWatch = thread_call_allocate(watchFire, h)) != nullptr) {
+            uint64_t dl; clock_interval_to_deadline(2000, kMillisecondScale, &dl); thread_call_enter_delayed(h->fWatch, dl);
+        }
         return h;
     }
     void detachRegs() { fRegs = nullptr; }
@@ -174,6 +202,7 @@ public:
     void free() override {
         if (fApply) { thread_call_cancel(fApply); while (!thread_call_free(fApply)) { thread_call_cancel(fApply); IOSleep(1); } fApply = nullptr; }
         if (fSave) { thread_call_cancel(fSave); while (!thread_call_free(fSave)) { thread_call_cancel(fSave); IOSleep(1); } fSave = nullptr; }
+        if (fWatch) { thread_call_t w = fWatch; fWatch = nullptr; thread_call_cancel(w); while (!thread_call_free(w)) { thread_call_cancel(w); IOSleep(1); } }
         if (fSync) { thread_call_cancel(fSync); while (!thread_call_free(fSync)) { thread_call_cancel(fSync); IOSleep(1); } fSync = nullptr; }
         OSSafeReleaseNULL(fDisp);
         IODisplayParameterHandler::free();
