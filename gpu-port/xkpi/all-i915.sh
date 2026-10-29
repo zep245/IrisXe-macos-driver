@@ -51,6 +51,7 @@ fi
 GD=$(find "$K/drm-kmod" -path '*i915/display/intel_display.c' | head -1)
 if [ -n "$GD" ]; then
     ${NMX_PY:-/opt/homebrew/bin/python3} patch_i915_committrace.py "$GD" || { echo "ERROR: commit trace patch failed"; exit 1; }
+    ${NMX_PY:-/opt/homebrew/bin/python3} patch_i915_fencewait.py "$GD" || { echo "ERROR: fence wait patch failed"; exit 1; }
 else
     echo "ERROR: display/intel_display.c not found"; exit 1
 fi
