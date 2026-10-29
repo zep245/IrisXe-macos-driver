@@ -290,6 +290,15 @@ extern "C" void nmx_stepn(const char *what, long n)
  */
 extern "C" volatile int nmx_steps_quiet;
 volatile int nmx_steps_quiet;
+/* b213: also quiet after the boot screen hand-over. Sequoia (10-29) still logged both "NullMoth commit:" lines on every
+   commit (~7 a second, ret=0): there WindowServer never calls NMXGPUFB::enableController in the accelerated setup, so
+   b126's switch never flipped. The hand-over is reached on every boot that shows the desktop. */
+extern "C" void nmx_steps_go_quiet(const char *why)
+{
+    if (nmx_steps_quiet || PE_parse_boot_argn("-nmxsteps", nullptr, 0)) return;
+    nmx_steps_quiet = 1;
+    IOLog("NullMoth GPU: per-commit log lines off from here (%s; -nmxsteps keeps them)\n", why ? why : "?");
+}
 extern "C" void nmx_step(const char *what)
 {
     static int seq;

@@ -100,6 +100,7 @@ int nmx_i915_psr(struct drm_device *drm, int on);
 #define NMX_CUR_DIM 256                 /* Tiger Lake cursor plane: 64, 128 or 256 square; macOS cursors fit in 256 */
 static void cursor_reapply(struct nmx_fb *fb);
 static int bridge_go(struct nmx_fb *fb, const char *why);
+void nmx_steps_go_quiet(const char *why);   /* b213, nmx_kext.cpp */
 
 /* one bridge per PCI function the port drives */
 #define MAX_FB 8
@@ -736,6 +737,8 @@ static int bridge_go(struct nmx_fb *fb, const char *why)
     bridge_log_outputs(fb, "hand-over");
     bridge_poll_outputs(fb, "hand-over");
     nmx_step(err ? "bridge: deferred mode set FAILED" : "bridge: deferred mode set committed");
+    if (!err)
+        nmx_steps_go_quiet("boot screen handed over");
     if (err)
         printf("NullMoth display: the deferred mode set failed (%d)\n", err);
     cursor_reapply(fb);
