@@ -2303,7 +2303,11 @@ static int nvmtl_dirty_only_on(void)
 typedef struct { nvmtl_slot s[2][NVMTL_NBIND];
                  uint8_t dirty[2]; VkDescriptorSet last[2]; unsigned last_idx[2]; uint32_t last_hi[2]; uint64_t lastw[2][4];
                  uint64_t chg[2][4]; uint64_t texgen[2]; const void *emb_fn[2]; uint64_t emb_gen[2]; uint32_t emb_n[2];
-                 uint64_t emb_key[2][NVMTL_EMB_KEYMAX]; } nvmtl_bindtable;
+                 uint64_t emb_key[2][NVMTL_EMB_KEYMAX];
+                 /* b232: hard[] = a non-buffer binding changed since the stage's set was made (a buffer-only change can
+                    keep the set: the shaders read buffers through the address table, which is re-snapshotted and reached
+                    by a dynamic offset); last_tbuf/last_dyn = the table page that set's binding 640 points at, and its offset */
+                 uint8_t hard[2]; VkBuffer last_tbuf[2]; uint32_t last_dyn[2]; } nvmtl_bindtable;
 
 static VkDescriptorSetLayout g_setLayout;
 #define NVMTL_MAX_POOLS 64
@@ -2504,7 +2508,25 @@ static int nvmtl_table_ubo(void)
     }
     return v;
 }
-static const uint32_t g_dyn_zero[2] = { 0, 0 };
+/* b232 (speed): the address table (binding 640, a UNIFORM_BUFFER_DYNAMIC) is written as { page, 0, one table } and the
+   table's place in the page goes in as the dynamic offset at bind time. A draw whose only change is a buffer binding
+   (setVertexBytes / setFragmentBytes move to a new place in the bytes ring on every draw) then keeps its descriptor set:
+   only the 1.5 KB table is re-snapshotted. Before, every such draw allocated and wrote a fresh set (~14 % of
+   WindowServer's CPU while scrolling, Tahoe 10-30 sample). Off: touch /Library/GPUBundles/nvmtl-nodynbuf (or
+   NVMTL_NO_DYNTABLE=1). Needs the Uniform table (nvmtl_table_ubo). */
+static unsigned long long g_dyn_reuse, g_dyn_new;
+static int nvmtl_dyntable_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("NVMTL_NO_DYNTABLE");
+        const int off = (e && *e && *e != '0') || access("/Library/GPUBundles/nvmtl-nodynbuf", F_OK) == 0;
+        v = !off && nvmtl_table_ubo();
+        nvlog("b232: dynamic address table %s (nvmtl-nodynbuf file %s, Uniform table %d)", v ? "ON - buffer-only changes keep the descriptor set" : "OFF",
+              access("/Library/GPUBundles/nvmtl-nodynbuf", F_OK) == 0 ? "present" : "absent", nvmtl_table_ubo());
+    }
+    return v;
+}
 static VkDescriptorType binding_type(uint32_t i)
 {
     if (i == NVMTL_ADDRESS_BINDING && nvmtl_table_ubo()) return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
@@ -2724,7 +2746,7 @@ static int nvmtl_bind_slot(nvk_cmdbuf *c, uint32_t set, uint32_t binding, uint8_
     if (sl->kind != kind || sl->h != h || sl->off != off) {
         t->dirty[set] = 1;
         t->chg[set][binding >> 6] |= 1ull << (binding & 63);
-        if (kind != NVMTL_SLOT_BUF || sl->kind != NVMTL_SLOT_BUF) t->texgen[set]++;
+        if (kind != NVMTL_SLOT_BUF || sl->kind != NVMTL_SLOT_BUF) { t->texgen[set]++; t->hard[set] = 1; }
     }
     sl->kind = kind; sl->h = h; sl->off = off;
     return 0;
@@ -2991,13 +3013,14 @@ static VkDescriptorSet nvmtl_snapshot_set_t(nvk_cmdbuf *c, uint32_t which, uint3
 }
 #define NVMTL_E78_HAS(m, i) (!(m) || (((m)[(i) >> 6] >> ((i) & 63)) & 1))
 static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb,
-                                             VkDescriptorSet from, const uint64_t *copym);
+                                             VkDescriptorSet from, const uint64_t *copym, const VkDescriptorBufferInfo *pre, VkBuffer *tbuf);
 static VkDescriptorSet nvmtl_snapshot_set_m(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb)
-{ return nvmtl_snapshot_set_md(c, which, stex_hi, mask, tb, VK_NULL_HANDLE, NULL); }
+{ return nvmtl_snapshot_set_md(c, which, stex_hi, mask, tb, VK_NULL_HANDLE, NULL, NULL, NULL); }
 #define NVMTL_COPY_HAS(m, i) ((m) && (((m)[(i) >> 6] >> ((i) & 63)) & 1))
 static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb,
-                                             VkDescriptorSet from, const uint64_t *copym)
+                                             VkDescriptorSet from, const uint64_t *copym, const VkDescriptorBufferInfo *pre, VkBuffer *tbuf)
 {
+    if (tbuf) *tbuf = VK_NULL_HANDLE;
     VkDescriptorSet set = VK_NULL_HANDLE; VkDescriptorPool pool = VK_NULL_HANDLE;
     VkResult r = VK_ERROR_OUT_OF_POOL_MEMORY;
     if (c->ndcache) {
@@ -3079,7 +3102,15 @@ have_set:
     VkBufferView tv[NVMTL_NBIND];
     VkDescriptorBufferInfo addressInfo;
     if (!g_mutable) tb = NULL;
-    if (NVMTL_E78_HAS(mask, NVMTL_ADDRESS_BINDING) && nvmtl_address_snapshot(c, which, &addressInfo)) { c->skipped++; return VK_NULL_HANDLE; }
+    if (which < 2) c->dyn[which] = 0;
+    if (NVMTL_E78_HAS(mask, NVMTL_ADDRESS_BINDING)) {
+        if (pre) addressInfo = *pre;
+        else if (nvmtl_address_snapshot(c, which, &addressInfo)) { c->skipped++; return VK_NULL_HANDLE; }
+        if (which < 2 && nvmtl_dyntable_on()) {   /* b232: the table's place in its page goes in as the dynamic offset */
+            c->dyn[which] = (uint32_t)addressInfo.offset; addressInfo.offset = 0;
+            if (tbuf) *tbuf = addressInfo.buffer;
+        }
+    }
     VkDescriptorBufferInfo dummyB = { (VkBuffer)g_dummyBuf.buf, 0, VK_WHOLE_SIZE };
     VkDescriptorImageInfo  dummyI = { VK_NULL_HANDLE, (VkImageView)g_dummyImg.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkDescriptorImageInfo  dummyS = { g_dummySampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
@@ -3154,7 +3185,32 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
     if (live && hi <= t->last_hi[which]) {
         int covered = 1;
         for (int k = 0; k < 4; k++) if (pm[k] & ~t->lastw[which][k]) covered = 0;
-        if (covered) { nvmtl_enc78_count(E78C_SETREUSE, 1); return t->last[which]; }
+        if (covered) { nvmtl_enc78_count(E78C_SETREUSE, 1); c->dyn[which] = t->last_dyn[which]; return t->last[which]; }
+    }
+    /* b232: only buffer bindings changed since the last set, and this pipeline reads no buffer descriptor directly (its
+       buffers come from the address table): keep the set, give it a fresh table snapshot through the dynamic offset */
+    VkDescriptorBufferInfo pre; int havepre = 0;
+    if (!live && !t->hard[which] && t->last[which] && t->last_idx[which] < c->nsets
+        && (VkDescriptorSet)c->sets[t->last_idx[which]].set == t->last[which] && hi <= t->last_hi[which]
+        && !(pm[0] & 0xffffffffull) && nvmtl_dyntable_on()) {
+        int covered = 1;
+        for (int k = 0; k < 4; k++) if (pm[k] & ~t->lastw[which][k]) covered = 0;
+        const int addr = (pm[NVMTL_ADDRESS_BINDING >> 6] >> (NVMTL_ADDRESS_BINDING & 63)) & 1;
+        if (covered && (!addr || t->last_tbuf[which])) {
+            if (addr && nvmtl_address_snapshot(c, which, &pre)) { c->skipped++; return VK_NULL_HANDLE; }
+            if (!addr || pre.buffer == t->last_tbuf[which]) {
+                if (addr) t->last_dyn[which] = (uint32_t)pre.offset;
+                c->dyn[which] = t->last_dyn[which];
+                t->dirty[which] = 0;
+                t->lastw[which][0] &= ~0xffffffffull;   /* its buffer descriptors no longer match the slots */
+                memset(t->chg[which], 0, sizeof t->chg[which]);
+                nvmtl_enc78_count(E78C_SETREUSE, 1);
+                const unsigned long long n = ++g_dyn_reuse;
+                if (!(n & (n - 1)) && n >= 64) nvlog("b232: %llu draws kept their descriptor set (buffer-only change), %llu new sets", n, g_dyn_new);
+                return t->last[which];
+            }
+            havepre = 1;   /* the table moved to a new page: a new set, with the snapshot already taken */
+        }
     }
     uint64_t m[4];
     for (int k = 0; k < 4; k++) m[k] = pm[k] | (live ? t->lastw[which][k] : 0);
@@ -3169,9 +3225,11 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
         }
         for (int k = 0; k < 4; k++) cm[k] &= ~t->chg[which][k];
     }
-    VkDescriptorSet s = nvmtl_snapshot_set_md(c, which, hi, m, NULL, from, from ? cm : NULL);
+    VkBuffer tbuf = VK_NULL_HANDLE;
+    VkDescriptorSet s = nvmtl_snapshot_set_md(c, which, hi, m, NULL, from, from ? cm : NULL, havepre ? &pre : NULL, &tbuf);
     if (!s) return s;
     t->last[which] = s; t->last_idx[which] = c->nsets - 1; t->last_hi[which] = hi; t->dirty[which] = 0;
+    t->hard[which] = 0; t->last_tbuf[which] = tbuf; t->last_dyn[which] = c->dyn[which]; g_dyn_new++;
     memset(t->chg[which], 0, sizeof t->chg[which]);
     memcpy(t->lastw[which], m, sizeof m);
     nvmtl_enc78_count(E78C_SETNEW, 1);
@@ -3243,7 +3301,7 @@ void nvmtl_vk_cmd_bind_set(nvk_cmdbuf *c, nvk_pipeline *p)
     if (g_sample_locations && c->sample_pattern.count)
         pvkCmdPushConstants(c->cb, (VkPipelineLayout)p->layout, VK_SHADER_STAGE_FRAGMENT_BIT, NVMTL_SAMPLE_POSITION_OFFSET,
                            NVMTL_SAMPLE_POSITION_BYTES, c->sample_pattern.position);
-    pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, g_dyn_zero);
+    pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, c->dyn);
 }
 
 #define NVMTL_DEPTH_USAGE (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | \
@@ -4441,7 +4499,7 @@ void nvmtl_vk_cmd_dispatch_threads(nvk_cmdbuf *c, nvk_pipeline *p, const uint32_
         VkPipeline vp = nvmtl_compute_variant(p, local);
         if (!vp) { c->skipped++; continue; }
         pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, vp);
-        if (!bound) { pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, g_dyn_zero); bound = 1; }
+        if (!bound) { pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, c->dyn); bound = 1; }
         // Metal allows any group count per axis; Vulkan caps it (NVK: 0x7fffffff x 65535 x 65535, the width of the QMD
         // grid fields). Geekbench's OpenCL Face Detection dispatched past 65535 on y and NAK's nak_fill_qmd aborted the
         // process. Split into chunks and advance thread_base/threadgroup_base, which the translated kernel adds to
@@ -4479,7 +4537,7 @@ void nvmtl_vk_cmd_dispatch_indirect_tg(nvk_cmdbuf *c, nvk_pipeline *p, nvk_buffe
     if (b->map && off + 12 <= b->size) memcpy(g, (const char *)b->map + off, 12);
     else { static int said; if (!said++) nvlog("vk: indirect dispatch grid is not CPU-visible — a kernel asking [[threads_per_grid]] reads 0"); }
     pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, vp);
-    pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, g_dyn_zero);
+    pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, c->dyn);
     uint32_t pc[12] = { g[0] * tg[0], g[1] * tg[1], g[2] * tg[2], 0, 0, 0, 0, 0, 0, g[0], g[1], g[2] };
     pvkCmdPushConstants(c->cb, (VkPipelineLayout)p->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, NVMTL_DISPATCH_PC_BYTES, pc);
     pvkCmdDispatchIndirect(c->cb, (VkBuffer)b->buf, off);
@@ -4491,7 +4549,7 @@ void nvmtl_vk_cmd_dispatch(nvk_cmdbuf *c, nvk_pipeline *p, uint32_t gx, uint32_t
                              nvmtl_snapshot_set_t(c, 1, p->stex_hi[1], p->tbany ? p->tbm[1] : NULL), g_heapSet };
     if (!s[0] || !s[1]) { c->nobind = 1; return; }
     c->nobind = 0;
-    pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, g_dyn_zero);
+    pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, c->dyn);
     // This path reads WorkgroupId raw (no base push constants), so it cannot be chunked. Past the device's group
     // count NAK aborts the whole app inside nak_fill_qmd; refuse the one dispatch loudly instead.
     if ((g_lim.maxComputeWorkGroupCount[1] && gy > g_lim.maxComputeWorkGroupCount[1]) ||
@@ -4897,7 +4955,7 @@ int nvmtl_vk_cmd_begin_pass(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p)
     c->fetch_rp = !rpShape && p->samples <= 1 && ncol && nvmtl_fbfetch_on();
     for (uint32_t i = 0; c->fetch_rp && i < ncol && i < NVMTL_NCOL; i++)
         if (cf[i] && ps->col[i] && (ps->col[i]->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) c->fetch_view[i] = ps->colview[i];
-    if (c->fetch_rp && c->table) ((nvmtl_bindtable *)c->table)->dirty[1] = 1;   /* no fragment set from another pass */
+    if (c->fetch_rp && c->table) { ((nvmtl_bindtable *)c->table)->dirty[1] = 1; ((nvmtl_bindtable *)c->table)->hard[1] = 1; }   /* no fragment set from another pass */
     c->fetch_pipe = p->fetch;
     if (p->pipe) pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pipe);
     VkViewport vp = { 0, (float)ps->h, (float)ps->w, -(float)ps->h, 0, 1 }; VkRect2D sc = { { 0, 0 }, { ps->w, ps->h } };

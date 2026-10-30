@@ -15,8 +15,6 @@ kernel-port design, the Metal plugin and the shader translator come from NullMot
 > **Experimental.** It runs daily on one machine (below), but it is a kernel driver for the GPU that drives your
 > screen. A bad build can leave the screen black or panic the Mac. Keep a way back (see [Safety](#safety)).
 
-Support me on https://buymeacoffee.com/zep245
-
 ## Tested machine
 
 | | |
@@ -169,6 +167,7 @@ Files in `/Library/GPUBundles/` (read at run time, no rebuild):
 | `nvmtl-icontest` | Tahoe: icon test mode with captures (use `nmx-icontest.sh`) |
 | `nvmtl-nolumswizzle` | Turn off the luminance swizzle for one-channel (LA08 / L008) surfaces |
 | `nvmtl-nopcache` | No on-disk pipeline cache (b214; compiled GPU programs are kept per process in the user cache folder) |
+| `nvmtl-nodynbuf` | Turns off the dynamic address table (b232): every draw whose buffers changed gets a new descriptor set again, as before b232 |
 
 ## Diagnostics
 
