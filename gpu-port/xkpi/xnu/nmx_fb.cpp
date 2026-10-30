@@ -43,6 +43,7 @@ class NMXBacklight : public IODisplayParameterHandler {
     uint32_t fFreq = 0;
     thread_call_t fApply = nullptr;
     volatile SInt32 fPending = -1;
+    volatile bool fPendingLinear = false;   /* b217: which parameter the pending level came from (log) */
     SInt32 fLevel = 100;
     thread_call_t fSave = nullptr;
     volatile bool fPowered = true;
@@ -150,7 +151,8 @@ private:
         uint32_t duty = me->dutyFor(v);
         me->fLevel = v;
         if (me->fPowered) *(volatile uint32_t *)(me->fRegs + kBlcDuty) = duty;
-        FBLOG("backlight: %d%% (duty %u of %u)%s", (int)v, duty, me->fFreq, me->fPowered ? "" : " (kept for wake)");
+        FBLOG("backlight: %d%% (duty %u of %u)%s%s", (int)v, duty, me->fFreq, me->fPowered ? "" : " (kept for wake)",
+              me->fPendingLinear ? " [linear-brightness]" : "");
         if (me->fSave) { uint64_t d; clock_interval_to_deadline(2000, kMillisecondScale, &d); thread_call_enter_delayed(me->fSave, d); }
         static int applied;
         if (applied < 3) { applied++; nmx_step("backlight: level applied"); }   /* first few only: spare the NVRAM */
@@ -187,12 +189,39 @@ public:
             display->retain(); fDisp = display; fSyncLeft = 2;
             uint64_t dl; clock_interval_to_deadline(5000, kMillisecondScale, &dl); thread_call_enter_delayed(fSync, dl);
         }
+        if (!fShownAt) fShownAt = mach_absolute_time();   /* b219 */
         FBLOG("backlight: brightness offered on %s, panel at %d%%", display->getName(), (int)fLevel);
         nmx_step("backlight: brightness offered to macOS");
         return true;
     }
+    /* b219: which parameter is the slider. b217 assumed "brightness" and ignored "linear-brightness" - the slider then
+       did nothing and the panel stayed at 100% (10-30): on this Mac the slider and keys write LINEAR brightness, and the
+       100% writes at wake and after boot come on "brightness". So: linear-brightness always sets the panel; a write on
+       "brightness" sets it only until the first linear write of this boot (a macOS that uses "brightness" for the
+       slider keeps working), and a 100% on "brightness" while no linear write was seen is ignored for the first 120 s
+       after the display came up (the boot burst). Boot-arg nmxbllinear=1: both always applied (before b217). */
+    volatile bool fSawLinear = false;
+    uint64_t fShownAt = 0;
     bool doIntegerSet(OSDictionary *, const OSSymbol *paramName, UInt32 value) override {
         if (paramName != gIODisplayBrightnessKey && paramName != gIODisplayLinearBrightnessKey) return false;
+        static int both = -1;
+        if (both < 0) { int v = 0; both = (PE_parse_boot_argn("nmxbllinear", &v, sizeof v) && v) ? 1 : 0; }
+        const bool linear = (paramName == gIODisplayLinearBrightnessKey);
+        if (linear) fSawLinear = true;
+        else if (!both) {
+            static unsigned said;
+            bool ignore = fSawLinear;
+            if (!ignore && value >= 100 && fShownAt) {
+                uint64_t w; nanoseconds_to_absolutetime(120ull * 1000000000ull, &w);
+                ignore = (mach_absolute_time() - fShownAt) < w;   /* within 120 s of the display coming up */
+            }
+            if (ignore) {
+                if (said++ < 12) FBLOG("backlight: brightness %u from macOS ignored (%s; panel stays at %d%%)", (unsigned)value,
+                                       fSawLinear ? "the slider uses linear-brightness" : "boot burst", (int)fLevel);
+                return true;
+            }
+        }
+        fPendingLinear = linear;
         fPending = value > 100 ? 100 : (SInt32)value;
         thread_call_enter(fApply);
         return true;

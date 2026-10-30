@@ -1,5 +1,5 @@
 #!/bin/bash
-# nmx-autoarm.sh (v12) - Phase 3: turn GPU acceleration (WindowServer on the Iris Xe) on at every boot, no script to run.
+# nmx-autoarm.sh (v13) - Phase 3: turn GPU acceleration (WindowServer on the Iris Xe) on at every boot, no script to run.
 # Runs once at boot from the LaunchDaemon com.nullmoth.autoarm. Log: /var/log/nmx-autoarm.log
 #
 # The boot-arg picks the mode (no nmxautoarm boot-arg = off):
@@ -20,7 +20,7 @@
 # Waiting steps never trip the guard (v3 tripped it after a normal shutdown during its wait, or after any early exit).
 LOG=/var/log/nmx-autoarm.log
 exec >>"$LOG" 2>&1
-echo "=== $(date) boot (autoarm v12)"
+echo "=== $(date) boot (autoarm v13)"
 # v5 (b136, 10-22): the waits were sized for the freeze hunt (45 s stable WindowServer, 120 s since boot, 20 s watch):
 # acceleration came ~2 min after a restart. The driver is stable now, so: 8 s stable, 25 s since boot, 3 s watch.
 # The old, cautious timings come back with: sudo touch /Library/GPUBundles/nmx-autoarm-slow
@@ -44,7 +44,15 @@ case "$MODE" in
     *) echo "boot-arg nmxautoarm=1/2/3 missing - not arming (that is the off switch)"; exit 0;;
 esac
 
-step() { echo "$(date +%T) $*"; nvram nmx-autoarm-step="$(date +%T) m$MODE $*" 2>/dev/null; sync; }
+# v13 (b218): only the steps the guard and the report need go to NVRAM (ARM / RESTART / DONE / SKIP / STOP). The "wait:"
+# steps ran while NMXGPU was still in its first mode set - which writes its own NVRAM breadcrumb at every step - and two
+# boots hung inside that mode set at unrelated steps (10-29: "07 commit fence" 16:29, "50 hw_done" 21:06), both times
+# while this helper had just written NVRAM. Firmware variable writes from two places at once are the suspect; the
+# wait phase only polls, so it is logged, not stored.
+step() {
+    echo "$(date +%T) $*"
+    case "$*" in ARM*|RESTART*|DONE*|SKIP*|STOP*) nvram nmx-autoarm-step="$(date +%T) m$MODE $*" 2>/dev/null; sync ;; esac
+}
 # v7 (b165): NMXGPU keeps the boot logo on screen until the accelerated WindowServer draws ("hold"). Whatever way this
 # script ends - armed, skipped, guarded, refused - it tells the driver to show the desktop now (NVRAM nmx-handover=1,
 # read and deleted by the driver within 250 ms; harmless when the hand-over has already happened).

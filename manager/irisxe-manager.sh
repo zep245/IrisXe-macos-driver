@@ -4,6 +4,7 @@
 #   irisxe-manager.sh status                    what is installed / loaded now (no root needed)
 #   irisxe-manager.sh scan <folder>             which driver parts a downloaded build folder contains (no root needed)
 #   sudo irisxe-manager.sh install <folder> <part>...   install the chosen parts from that folder
+#        (a part written part@<other folder> comes from that folder, e.g. fullplugin@<Mesa build>)
 #        parts: gpu accel agdc plugin fullplugin xlate autoarm
 #   sudo irisxe-manager.sh repair               clear the two safety locks (after a hang); restart afterwards
 #   sudo irisxe-manager.sh armnow               turn acceleration on now (restarts the desktop, open apps close)
@@ -34,7 +35,11 @@ find_part() {   # $1 folder, $2 part -> path or nothing
            find "$d" -maxdepth 6 -type d -name NVMTLDriver.bundle 2>/dev/null |
                while IFS= read -r f; do [ -f "$f/Contents/MacOS/air-runtime/libLLVM.dylib" ] && { echo "$f"; break; }; done ;;
     xlate) find "$d" -maxdepth 6 -type f -name libnvmtl_translate.dylib -not -path '*/air-runtime/*' 2>/dev/null | head -1 ;;
-    autoarm) [ -f "$HERE/helpers/nmx-autoarm/install-autoarm.sh" ] && echo "$HERE/helpers/nmx-autoarm" ;;
+    autoarm) # b221: the helper inside the chosen build (its out/IrisXe Manager.app) first - the one bundled in THIS app
+           # may be older (10-29: an app from b204 kept installing autoarm v11)
+           f=$(find "$d" -maxdepth 7 -type f -path '*/helpers/nmx-autoarm/install-autoarm.sh' 2>/dev/null | head -1)
+           if [ -n "$f" ]; then dirname "$f"
+           elif [ -f "$HERE/helpers/nmx-autoarm/install-autoarm.sh" ]; then echo "$HERE/helpers/nmx-autoarm"; fi ;;
     esac
 }
 
@@ -104,7 +109,7 @@ install_kext() {   # $1 source kext, $2 name
     rm -rf "$d" && ditto "$s" "$d" || { say "  ERROR: copy failed"; return 1; }
     chown -R root:wheel "$d"; chmod -R 755 "$d"; xattr -dr com.apple.quarantine "$d" 2>/dev/null
     say "  $n.kext installed - macOS adds it at the next restart (approve it in Privacy & Security if asked)"
-    KEXTS_CHANGED=1; CHANGED_KEXTS="$CHANGED_KEXTS $2"
+    KEXTS_CHANGED=1; CHANGED_KEXTS="${CHANGED_KEXTS:-} $2"
 }
 install_plugin_binary() {   # quiet plugin: replace only the binary (+Info.plist), keep air-runtime/ (nmx-plugin-update.sh)
     local s=$1 D="$GB/NVMTLDriver.bundle"
@@ -142,9 +147,12 @@ cmd_install() {
     need_root
     local d=${1:?folder}; shift
     [ $# -gt 0 ] || { say "nothing chosen"; exit 0; }
-    KEXTS_CHANGED=0; local fails=0
+    KEXTS_CHANGED=0; CHANGED_KEXTS=""; local fails=0
     for p in "$@"; do
-        local f; f=$(find_part "$d" "$p")
+        # b221: "part@folder" takes that part from another folder (the Mesa build for fullplugin)
+        local pd=$d
+        case $p in *@*) pd=${p#*@}; p=${p%%@*} ;; esac
+        local f; f=$(find_part "$pd" "$p")
         say "== $p"
         [ -n "$f" ] || { say "  not in this folder - skipped"; continue; }
         say "  from: $f"

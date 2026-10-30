@@ -27,6 +27,7 @@ struct StatusRow: Identifiable {
 
 final class Model: ObservableObject {
     @Published var folder = ""
+    @Published var mesaFolder = ""   // b221: the Mesa build (full Metal plugin), chosen on its own
     @Published var parts: [Part] = [
         Part(id: "gpu", title: "Display driver (NMXGPU.kext)", note: "screen, brightness, sleep - restart needed"),
         Part(id: "accel", title: "Accelerator (NMXAccel.kext)", note: "the right one for this macOS is picked - restart needed"),
@@ -101,30 +102,102 @@ final class Model: ObservableObject {
         }
     }
 
-    func chooseFolder() {
+    // ---- the two downloads: the NMXGPU build (drivers, quiet plugin, translator, helper) and the Mesa ANV build ----
+    // b223: each chooser accepts only its own kind of download and says which button the other one belongs to.
+    private func parseScan(_ out: String) -> [String: (path: String, date: String)] {
+        var r: [String: (path: String, date: String)] = [:]
+        for line in out.split(separator: "\n") {
+            let kv = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            guard kv.count == 2 else { continue }
+            let pd = kv[1].split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+            r[kv[0]] = (pd.first ?? "", pd.count > 1 ? pd[1] : "")
+        }
+        return r
+    }
+
+    private func warn(_ title: String, _ text: String) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        a.addButton(withTitle: "OK")
+        a.runModal()
+    }
+
+    private func pickFolder(_ message: String) -> String? {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
-        panel.message = "Choose the unzipped build you downloaded from GitHub (the folder that contains 'out')"
-        if panel.runModal() == .OK, let url = panel.url {
-            folder = url.path
-            scan()
+        panel.message = message
+        return panel.runModal() == .OK ? panel.url?.path : nil
+    }
+
+    func chooseFolder() {
+        guard let path = pickFolder("Choose the unzipped NMXGPU build (GitHub artifact nmxgpu-macos-...)") else { return }
+        run(["scan", path], admin: false) { out in
+            let r = self.parseScan(out)
+            let hasGPU = !(r["gpu"]?.path ?? "").isEmpty
+            let hasMesa = !(r["fullplugin"]?.path ?? "").isEmpty
+            guard hasGPU else {
+                if hasMesa {
+                    self.warn("This is the Mesa ANV build", "The folder you chose is the Mesa ANV build (the full Metal plugin). Choose it with \"Choose Mesa ANV Build...\" instead.")
+                } else {
+                    self.warn("No NMXGPU build in this folder", "This folder has no NMXGPU.kext. Choose the unzipped NMXGPU build from GitHub (the folder that contains 'out').")
+                }
+                return
+            }
+            self.folder = path
+            self.apply(r, skipFull: !self.mesaFolder.isEmpty)
+        }
+    }
+
+    func chooseMesaFolder() {
+        guard let path = pickFolder("Choose the unzipped Mesa ANV build (GitHub artifact nmx-vulkan-...) - it has the full Metal plugin") else { return }
+        run(["scan", path], admin: false) { out in
+            let r = self.parseScan(out)
+            let hasGPU = !(r["gpu"]?.path ?? "").isEmpty
+            let hasMesa = !(r["fullplugin"]?.path ?? "").isEmpty
+            guard hasMesa else {
+                if hasGPU {
+                    self.warn("This is the NMXGPU build", "The folder you chose is the NMXGPU build (drivers and the plugin update). Choose it with \"Choose NMXGPU Build...\" instead.")
+                } else {
+                    self.warn("No Mesa ANV build in this folder", "This folder has no full Metal plugin (NVMTLDriver.bundle with its shader reader). Choose the unzipped Mesa ANV build from GitHub.")
+                }
+                return
+            }
+            self.mesaFolder = path
+            if let i = self.parts.firstIndex(where: { $0.id == "fullplugin" }) {
+                self.parts[i].path = r["fullplugin"]?.path ?? ""
+                self.parts[i].date = r["fullplugin"]?.date ?? ""
+            }
+        }
+    }
+
+    // fill the parts from a scan; the full plugin comes from the Mesa build once one is chosen
+    private func apply(_ r: [String: (path: String, date: String)], skipFull: Bool) {
+        for i in parts.indices {
+            if parts[i].id == "fullplugin" && skipFull { continue }
+            parts[i].path = r[parts[i].id]?.path ?? ""
+            parts[i].date = r[parts[i].id]?.date ?? ""
+            if parts[i].path.isEmpty { parts[i].chosen = false }
+        }
+    }
+
+    // refresh: scan both chosen folders again
+    func scanMesa() {
+        guard !mesaFolder.isEmpty else { return }
+        run(["scan", mesaFolder], admin: false) { out in
+            let r = self.parseScan(out)
+            guard let i = self.parts.firstIndex(where: { $0.id == "fullplugin" }) else { return }
+            self.parts[i].path = r["fullplugin"]?.path ?? ""
+            self.parts[i].date = r["fullplugin"]?.date ?? ""
+            if self.parts[i].path.isEmpty { self.parts[i].chosen = false }
         }
     }
 
     func scan() {
         guard !folder.isEmpty else { return }
-        run(["scan", folder], admin: false) { out in
-            for line in out.split(separator: "\n") {
-                let kv = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
-                guard kv.count == 2, let i = self.parts.firstIndex(where: { $0.id == kv[0] }) else { continue }
-                let pd = kv[1].split(separator: "|", omittingEmptySubsequences: false).map(String.init)
-                self.parts[i].path = pd.first ?? ""
-                self.parts[i].date = pd.count > 1 ? pd[1] : ""
-                if self.parts[i].path.isEmpty { self.parts[i].chosen = false }
-            }
-        }
+        run(["scan", folder], admin: false) { out in self.apply(self.parseScan(out), skipFull: !self.mesaFolder.isEmpty) }
     }
 
     func chooseAllFound() {
@@ -135,11 +208,15 @@ final class Model: ObservableObject {
     }
 
     func install() {
-        let chosen = parts.filter { $0.chosen && !$0.path.isEmpty }.map { $0.id }
+        // the full plugin first: it replaces the whole bundle, the quiet update then replaces only its program
+        let picked = parts.filter { $0.chosen && !$0.path.isEmpty }
+        let ordered = picked.filter { $0.id == "fullplugin" } + picked.filter { $0.id != "fullplugin" }
+        let chosen = ordered.map { ($0.id == "fullplugin" && !mesaFolder.isEmpty) ? "fullplugin@" + mesaFolder : $0.id }
         guard !chosen.isEmpty else { appendLog("Nothing chosen."); return }
+        let base = folder.isEmpty ? mesaFolder : folder
         busy = true
-        appendLog("Installing: " + chosen.joined(separator: ", "))
-        run(["install", folder] + chosen, admin: true) { out in
+        appendLog("Installing: " + chosen.map { $0.components(separatedBy: "@").first ?? $0 }.joined(separator: ", "))
+        run(["install", base] + chosen, admin: true) { out in
             self.appendLog(out)
             self.busy = false
             self.refresh()
@@ -179,7 +256,7 @@ struct ContentView: View {
                 Text("Iris Xe Driver").font(.title2).bold()
                 Spacer()
                 if m.busy { ProgressView().controlSize(.small) }
-                Button { m.refresh(); m.scan() } label: { Label("Refresh", systemImage: "arrow.clockwise") }
+                Button { m.refresh(); m.scan(); m.scanMesa() } label: { Label("Refresh", systemImage: "arrow.clockwise") }
             }
 
             GroupBox("Now") {
@@ -199,13 +276,23 @@ struct ContentView: View {
                 .padding(4)
             }
 
-            GroupBox("Install from a downloaded build") {
+            GroupBox("Install from the downloaded builds") {
                 VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Text(m.folder.isEmpty ? "No folder chosen" : m.folder)
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("NMXGPU build").bold().frame(width: 120, alignment: .leading)
+                        Text(m.folder.isEmpty ? "not chosen - drivers, plugin update, translator, helper" : (m.folder as NSString).lastPathComponent)
                             .lineLimit(1).truncationMode(.middle).foregroundStyle(m.folder.isEmpty ? .secondary : .primary)
+                            .help(m.folder)
                         Spacer()
-                        Button("Choose Folder...") { m.chooseFolder() }
+                        Button("Choose NMXGPU Build...") { m.chooseFolder() }
+                    }
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Mesa ANV build").bold().frame(width: 120, alignment: .leading)
+                        Text(m.mesaFolder.isEmpty ? "not chosen - full Metal plugin, only needed on a new macOS" : (m.mesaFolder as NSString).lastPathComponent)
+                            .lineLimit(1).truncationMode(.middle).foregroundStyle(m.mesaFolder.isEmpty ? .secondary : .primary)
+                            .help(m.mesaFolder)
+                        Spacer()
+                        Button("Choose Mesa ANV Build...") { m.chooseMesaFolder() }
                     }
                     Divider()
                     ForEach($m.parts) { $p in

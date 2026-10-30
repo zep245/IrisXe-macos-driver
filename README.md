@@ -107,7 +107,8 @@ Pinned upstream versions (bumping them means fixing the port):
 ## Installing
 
 **IrisXe Manager** (`manager/`, built into the artifact as `out/IrisXe Manager.app`) does the steps below from a window:
-pick the unzipped build folder, tick the parts (display driver, accelerator - the right one for the running macOS is
+pick the unzipped NMXGPU build ("Choose NMXGPU Build...") and, for a first install on a new macOS, the unzipped Mesa ANV build
+("Choose Mesa ANV Build...", only the full Metal plugin comes from it), tick the parts (display driver, accelerator - the right one for the running macOS is
 picked -, display helper, Metal plugin update or full plugin, shader translator, acceleration at every boot) and press
 Install; the old files are kept in `/Library/Application Support/IrisXe/backup/`. "Clear Safety Locks" removes the
 NVRAM guards after a hang, "Turn Acceleration On Now" arms without a restart. The same actions by hand:

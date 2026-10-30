@@ -352,6 +352,20 @@ int nmx_fb_set_size(void *dev, uint32_t w, uint32_t h)
             printf("NullMoth display: desktop %ux%u noted, applied at the boot screen hand-over\n", w ? w : fb->info.width,
                    h ? h : fb->info.height);
         } else {
+            /* b222 (Tahoe 10-30: the Apple logo jumped to the lower right again): the hand-over showed buffer 0 at the
+               native size - still the first WindowServer's boot logo, drawn for 2560x1600 - and 0.16 s later the
+               desktop switched to 1600x1000, so the panel fitter enlarged that logo's top-left part. b198 only cleared
+               buffer 0 when the size was already scaled AT the hand-over. Any picture in the buffer is in the old
+               layout once the size changes (WindowServer redraws for the new size anyway), so the buffer is cleared
+               to black before the new size is committed. Written only, never read (GPU aperture). */
+            if (fb->mapped) {
+                char *va = fb->map.is_iomem ? (char *)fb->map.vaddr_iomem : (char *)fb->map.vaddr;
+                if (va) {
+                    memset(va, 0, (size_t)fb->info.pitch * fb->info.height);
+                    printf("NullMoth display: desktop size change to %ux%u - buffer 0 cleared (no picture in the old layout)\n",
+                           w ? w : fb->info.width, h ? h : fb->info.height);
+                }
+            }
             nmx_step(w ? "bridge: scaled desktop commit" : "bridge: native desktop commit");
             err = -bridge_commit(fb, "desktop size");
             nmx_step("bridge: desktop size commit returned");
