@@ -86,11 +86,11 @@ class NMXBacklight : public IODisplayParameterHandler {
         if (cur) {
             OSDictionary *params = OSDictionary::withDictionary(cur);
             if (params) {
-                IODisplay::setParameter(params, gIODisplayBrightnessKey, me->fLevel);
-                IODisplay::setParameter(params, gIODisplayLinearBrightnessKey, me->fLevel);
+                IODisplay::setParameter(params, gIODisplayBrightnessKey, me->fUser);
+                IODisplay::setParameter(params, gIODisplayLinearBrightnessKey, me->fUser);
                 d->setProperty(gIODisplayParametersKey, params);
                 params->release();
-                FBLOG("backlight: slider re-synced to %d%%", (int)me->fLevel);
+                FBLOG("backlight: slider re-synced to %d%%", (int)me->fUser);
             }
         }
         OSSafeReleaseNULL(old);
@@ -106,7 +106,7 @@ class NMXBacklight : public IODisplayParameterHandler {
         IORegistryEntry *e = IORegistryEntry::fromPath("/options", gIODTPlane);
         IODTNVRAM *n = OSDynamicCast(IODTNVRAM, e);
         if (n == nullptr) { if (e) e->release(); return; }
-        uint8_t b = (uint8_t)(me->fLevel < 0 ? 0 : (me->fLevel > 100 ? 100 : me->fLevel));
+        uint8_t b = (uint8_t)(me->fUser < 0 ? 0 : (me->fUser > 100 ? 100 : me->fUser));   /* b224: the user's level, not a dimmed one */
         const OSSymbol *k = OSSymbol::withCString("nmintelfb-brightness");
         OSData *d = OSData::withBytes(&b, 1);
         if (k && d) n->setProperty(k, d);
@@ -162,6 +162,7 @@ public:
         NMXBacklight *h = OSTypeAlloc(NMXBacklight);
         if (!h || !h->init()) { OSSafeReleaseNULL(h); return nullptr; }
         h->fRegs = regs; h->fFreq = freq; h->fLevel = level < 0 ? 0 : (level > 100 ? 100 : level);
+        h->fUser = h->fLevel; h->fDim = 100;   /* b224 */
         h->fApply = thread_call_allocate(applyFire, h);
         h->fSave = thread_call_allocate(saveFire, h);
         h->fSync = thread_call_allocate(syncFire, h);
@@ -180,9 +181,9 @@ public:
         OSSafeReleaseNULL(old);
         if (!params) return false;
         IODisplay::addParameter(params, gIODisplayBrightnessKey, 0, 100);
-        IODisplay::setParameter(params, gIODisplayBrightnessKey, fLevel);
+        IODisplay::setParameter(params, gIODisplayBrightnessKey, fUser);
         IODisplay::addParameter(params, gIODisplayLinearBrightnessKey, 0, 100);
-        IODisplay::setParameter(params, gIODisplayLinearBrightnessKey, fLevel);
+        IODisplay::setParameter(params, gIODisplayLinearBrightnessKey, fUser);
         display->setProperty(gIODisplayParametersKey, params);
         params->release();
         if (fSync && fDisp == nullptr) {
@@ -194,35 +195,32 @@ public:
         nmx_step("backlight: brightness offered to macOS");
         return true;
     }
-    /* b219: which parameter is the slider. b217 assumed "brightness" and ignored "linear-brightness" - the slider then
-       did nothing and the panel stayed at 100% (10-30): on this Mac the slider and keys write LINEAR brightness, and the
-       100% writes at wake and after boot come on "brightness". So: linear-brightness always sets the panel; a write on
-       "brightness" sets it only until the first linear write of this boot (a macOS that uses "brightness" for the
-       slider keeps working), and a 100% on "brightness" while no linear write was seen is ignored for the first 120 s
-       after the display came up (the boot burst). Boot-arg nmxbllinear=1: both always applied (before b217). */
-    volatile bool fSawLinear = false;
+    /* b224 (10-30: "the screen no longer dims a few seconds before display sleep - it goes dark at once"): b219 ignored
+       "brightness" writes once the slider's linear-brightness had been seen - and macOS's idle dim comes on
+       "brightness". The two parameters are not two copies of one level: linear-brightness is the user's level (slider,
+       keys), "brightness" is macOS's dim factor on top of it - 100 = not dimmed (the 100s at wake and after boot that
+       b215-b219 chased), lower = dimmed before display sleep. The panel shows user x dim / 100 (never below the panel
+       minimum); the user level alone is what is saved and shown on the slider. Boot-arg nmxbllinear=1: both parameters
+       set the panel directly (before b217). */
+    SInt32 fUser = 100;          /* linear-brightness: the user's level, 0-100 */
+    SInt32 fDim = 100;           /* brightness: macOS's dim factor, 100 = not dimmed */
     uint64_t fShownAt = 0;
     bool doIntegerSet(OSDictionary *, const OSSymbol *paramName, UInt32 value) override {
         if (paramName != gIODisplayBrightnessKey && paramName != gIODisplayLinearBrightnessKey) return false;
         static int both = -1;
         if (both < 0) { int v = 0; both = (PE_parse_boot_argn("nmxbllinear", &v, sizeof v) && v) ? 1 : 0; }
         const bool linear = (paramName == gIODisplayLinearBrightnessKey);
-        if (linear) fSawLinear = true;
-        else if (!both) {
+        const SInt32 v = value > 100 ? 100 : (SInt32)value;
+        SInt32 eff;
+        if (both) { eff = v; if (linear) fUser = v; }
+        else {
+            if (linear) fUser = v; else fDim = v;
+            eff = (SInt32)(((int64_t)fUser * fDim) / 100);
             static unsigned said;
-            bool ignore = fSawLinear;
-            if (!ignore && value >= 100 && fShownAt) {
-                uint64_t w; nanoseconds_to_absolutetime(120ull * 1000000000ull, &w);
-                ignore = (mach_absolute_time() - fShownAt) < w;   /* within 120 s of the display coming up */
-            }
-            if (ignore) {
-                if (said++ < 12) FBLOG("backlight: brightness %u from macOS ignored (%s; panel stays at %d%%)", (unsigned)value,
-                                       fSawLinear ? "the slider uses linear-brightness" : "boot burst", (int)fLevel);
-                return true;
-            }
+            if (!linear && said++ < 16) FBLOG("backlight: dim %d%% from macOS - panel %d%% of the user's %d%%", (int)fDim, (int)eff, (int)fUser);
         }
         fPendingLinear = linear;
-        fPending = value > 100 ? 100 : (SInt32)value;
+        fPending = eff;
         thread_call_enter(fApply);
         return true;
     }
