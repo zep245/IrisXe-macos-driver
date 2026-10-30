@@ -195,14 +195,15 @@ public:
         nmx_step("backlight: brightness offered to macOS");
         return true;
     }
-    /* b225 (Sequoia log 10-30 08:16 - what macOS really sends): linear-brightness = the user's level (slider, keys);
-       "brightness" = the level macOS wants on the panel right now, on the same scale: 12 in normal use with the slider
-       at 12-16, 1 when it dims before display sleep, 0 when it turns the backlight off, 12 again when it comes back.
-       Both are absolute levels - b224 multiplied them (full slider gave 12%), b219 ignored "brightness" (no dimming).
-       The one bad value is a "brightness" far ABOVE the user's level (100 at wake / after boot on Tahoe, 10-29) - a
-       dim or an undim never goes there. So: linear-brightness sets the panel and the user level; "brightness" sets the
-       panel unless it is more than 10 points above the user level (then ignored, logged). Boot-arg nmxbllinear=1:
-       both always applied (before b217). */
+    /* b226 (Tahoe log 10-30 09:04): b225 treated "brightness" as an absolute level on the slider's scale - true on
+       Sequoia by chance (slider 12-16, brightness 12). On Tahoe the slider was at 100 and after display sleep macOS
+       sent brightness 11: the panel stayed at 11% with the slider at full; after a restart the same. What "brightness"
+       carries reliably, on both systems: 1 = dim before display sleep, 0 = backlight off, and some other value ("12",
+       "11", "100") = back to normal - its number is macOS's own stored value, not the slider. So:
+         linear-brightness -> the user's level: panel and slider;
+         brightness <= 3   -> dim / off: panel at that level (the user level is kept);
+         brightness > 3    -> "normal again": panel back at the user's level.
+       Boot-arg nmxbllinear=1: both set the panel directly (before b217). */
     SInt32 fUser = 100;          /* linear-brightness: the user's level, 0-100 (saved, shown on the slider) */
     uint64_t fShownAt = 0;
     bool doIntegerSet(OSDictionary *, const OSSymbol *paramName, UInt32 value) override {
@@ -210,12 +211,28 @@ public:
         static int both = -1;
         if (both < 0) { int v = 0; both = (PE_parse_boot_argn("nmxbllinear", &v, sizeof v) && v) ? 1 : 0; }
         const bool linear = (paramName == gIODisplayLinearBrightnessKey);
-        const SInt32 v = value > 100 ? 100 : (SInt32)value;
+        SInt32 v = value > 100 ? 100 : (SInt32)value;
         if (linear) fUser = v;
-        else if (!both && v > fUser + 10) {
+        else if (!both) {
             static unsigned said;
-            if (said++ < 16) FBLOG("backlight: brightness %d%% from macOS ignored - far above the user's %d%% (wake / boot reset)", (int)v, (int)fUser);
-            return true;
+            if (v > 3) {
+                if (said++ < 16) FBLOG("backlight: brightness %d from macOS = normal again - panel at the user's %d%%", (int)v, (int)fUser);
+                /* b228: macOS now believes the level is v (100 / 11 / 12) and Control Center's slider shows that until
+                   it reads the display's parameters again (10-30: full for ~1 s after opening, then the real level).
+                   Write the user's level into the parameters at once, so the slider is right from the start. */
+                if (v != fUser && fSync && fDisp) {
+                    fSyncLeft = 1;
+                    uint64_t dl; clock_interval_to_deadline(150, kMillisecondScale, &dl); thread_call_enter_delayed(fSync, dl);
+                }
+                v = fUser;
+            } else {
+                /* b227: dim like a real MacBook - half of the user's level (never below the panel minimum), not the
+                   minimum macOS's "1" would give; 0 stays the backlight going off */
+                const SInt32 req = v;
+                if (v > 0) v = fUser / 2;
+                if (said++ < 16) FBLOG("backlight: brightness %d from macOS = %s - panel %d%% (user level %d%% kept)", (int)req,
+                                       v ? "dim before display sleep" : "backlight off", (int)v, (int)fUser);
+            }
         }
         fPendingLinear = linear;
         fPending = v;
