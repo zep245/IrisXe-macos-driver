@@ -9,6 +9,7 @@
  */
 #include <IOKit/IOLib.h>
 #include <IOKit/graphics/IOFramebuffer.h>
+#include <IOKit/IOMessage.h>   /* b230: kIOMessageServicePropertyChange */
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/OSAtomic.h>
@@ -90,7 +91,12 @@ class NMXBacklight : public IODisplayParameterHandler {
                 IODisplay::setParameter(params, gIODisplayLinearBrightnessKey, me->fUser);
                 d->setProperty(gIODisplayParametersKey, params);
                 params->release();
-                FBLOG("backlight: slider re-synced to %d%%", (int)me->fUser);
+                /* b230: tell the display's clients (CoreBrightness / Control Center) that the parameters changed, so they
+                   read the new level now - not when Control Center is next opened (10-30: after a restart the slider
+                   showed full and jumped to the real level ~1 s after Control Center opened) */
+                d->messageClients(kIOMessageServicePropertyChange);
+                static unsigned resynced;
+                if (resynced++ < 8) FBLOG("backlight: slider re-synced to %d%%", (int)me->fUser);
             }
         }
         OSSafeReleaseNULL(old);
@@ -187,7 +193,7 @@ public:
         display->setProperty(gIODisplayParametersKey, params);
         params->release();
         if (fSync && fDisp == nullptr) {
-            display->retain(); fDisp = display; fSyncLeft = 2;
+            display->retain(); fDisp = display; fSyncLeft = 6;   /* b230: 5, 20, 35, 50, 65, 80 s after boot (login restores macOS's own value) */
             uint64_t dl; clock_interval_to_deadline(5000, kMillisecondScale, &dl); thread_call_enter_delayed(fSync, dl);
         }
         if (!fShownAt) fShownAt = mach_absolute_time();   /* b219 */
@@ -212,7 +218,18 @@ public:
         if (both < 0) { int v = 0; both = (PE_parse_boot_argn("nmxbllinear", &v, sizeof v) && v) ? 1 : 0; }
         const bool linear = (paramName == gIODisplayLinearBrightnessKey);
         SInt32 v = value > 100 ? 100 : (SInt32)value;
-        if (linear) fUser = v;
+        if (linear) {
+            fUser = v;
+            /* b229: keep the display's stored parameters at the user's level all the time (both keys), not only at boot.
+               macOS remembers "brightness" from these parameters and sends it back after display sleep / wake - with
+               the parameters stale it sent 100 / 11, the slider showed that and jumped to the real level ~1 s after
+               Control Center opened (b228 only fixed the parameters AFTER such a value). Written 300 ms after the last
+               slider move. */
+            if (fSync && fDisp && !both) {
+                fSyncLeft = 1;
+                uint64_t dl; clock_interval_to_deadline(300, kMillisecondScale, &dl); thread_call_enter_delayed(fSync, dl);
+            }
+        }
         else if (!both) {
             static unsigned said;
             if (v > 3) {
