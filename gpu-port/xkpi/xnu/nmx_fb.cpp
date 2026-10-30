@@ -162,7 +162,7 @@ public:
         NMXBacklight *h = OSTypeAlloc(NMXBacklight);
         if (!h || !h->init()) { OSSafeReleaseNULL(h); return nullptr; }
         h->fRegs = regs; h->fFreq = freq; h->fLevel = level < 0 ? 0 : (level > 100 ? 100 : level);
-        h->fUser = h->fLevel; h->fDim = 100;   /* b224 */
+        h->fUser = h->fLevel;   /* b224/b225 */
         h->fApply = thread_call_allocate(applyFire, h);
         h->fSave = thread_call_allocate(saveFire, h);
         h->fSync = thread_call_allocate(syncFire, h);
@@ -195,15 +195,15 @@ public:
         nmx_step("backlight: brightness offered to macOS");
         return true;
     }
-    /* b224 (10-30: "the screen no longer dims a few seconds before display sleep - it goes dark at once"): b219 ignored
-       "brightness" writes once the slider's linear-brightness had been seen - and macOS's idle dim comes on
-       "brightness". The two parameters are not two copies of one level: linear-brightness is the user's level (slider,
-       keys), "brightness" is macOS's dim factor on top of it - 100 = not dimmed (the 100s at wake and after boot that
-       b215-b219 chased), lower = dimmed before display sleep. The panel shows user x dim / 100 (never below the panel
-       minimum); the user level alone is what is saved and shown on the slider. Boot-arg nmxbllinear=1: both parameters
-       set the panel directly (before b217). */
-    SInt32 fUser = 100;          /* linear-brightness: the user's level, 0-100 */
-    SInt32 fDim = 100;           /* brightness: macOS's dim factor, 100 = not dimmed */
+    /* b225 (Sequoia log 10-30 08:16 - what macOS really sends): linear-brightness = the user's level (slider, keys);
+       "brightness" = the level macOS wants on the panel right now, on the same scale: 12 in normal use with the slider
+       at 12-16, 1 when it dims before display sleep, 0 when it turns the backlight off, 12 again when it comes back.
+       Both are absolute levels - b224 multiplied them (full slider gave 12%), b219 ignored "brightness" (no dimming).
+       The one bad value is a "brightness" far ABOVE the user's level (100 at wake / after boot on Tahoe, 10-29) - a
+       dim or an undim never goes there. So: linear-brightness sets the panel and the user level; "brightness" sets the
+       panel unless it is more than 10 points above the user level (then ignored, logged). Boot-arg nmxbllinear=1:
+       both always applied (before b217). */
+    SInt32 fUser = 100;          /* linear-brightness: the user's level, 0-100 (saved, shown on the slider) */
     uint64_t fShownAt = 0;
     bool doIntegerSet(OSDictionary *, const OSSymbol *paramName, UInt32 value) override {
         if (paramName != gIODisplayBrightnessKey && paramName != gIODisplayLinearBrightnessKey) return false;
@@ -211,16 +211,14 @@ public:
         if (both < 0) { int v = 0; both = (PE_parse_boot_argn("nmxbllinear", &v, sizeof v) && v) ? 1 : 0; }
         const bool linear = (paramName == gIODisplayLinearBrightnessKey);
         const SInt32 v = value > 100 ? 100 : (SInt32)value;
-        SInt32 eff;
-        if (both) { eff = v; if (linear) fUser = v; }
-        else {
-            if (linear) fUser = v; else fDim = v;
-            eff = (SInt32)(((int64_t)fUser * fDim) / 100);
+        if (linear) fUser = v;
+        else if (!both && v > fUser + 10) {
             static unsigned said;
-            if (!linear && said++ < 16) FBLOG("backlight: dim %d%% from macOS - panel %d%% of the user's %d%%", (int)fDim, (int)eff, (int)fUser);
+            if (said++ < 16) FBLOG("backlight: brightness %d%% from macOS ignored - far above the user's %d%% (wake / boot reset)", (int)v, (int)fUser);
+            return true;
         }
         fPendingLinear = linear;
-        fPending = eff;
+        fPending = v;
         thread_call_enter(fApply);
         return true;
     }
