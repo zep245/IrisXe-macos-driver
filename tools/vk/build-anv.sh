@@ -64,6 +64,8 @@ msetup "$W/libdrm" "$W/b-libdrm" -Dintel=disabled -Damdgpu=disabled -Dradeon=dis
 ninja -C "$W/b-libdrm" install > "$LOG/libdrm-build.log" 2>&1 || { tail -60 "$LOG/libdrm-build.log"; exit 1; }
 
 say "mesa (ANV)"
+# b240: video codecs on (H.264/H.265/AV1/VP9 decode through Vulkan Video) for hardware video decoding, stage 1:
+# the probe below asks the GPU what it can decode. NMX_VIDEO_CODECS= (empty) builds without them, as before b240.
 # Mesa builds the Intel driver's internal shaders with its own OpenCL compiler (mesa_clc), so LLVM, Clang, libclc and
 # the SPIR-V translator are needed at build time only (from conda-forge, MESA_LLVM_PREFIX; Homebrew compiles LLVM from
 # source on Intel runners). The finished driver does not link LLVM.
@@ -78,7 +80,7 @@ fi
 export CC=/usr/bin/clang CXX=/usr/bin/clang++
 msetup "$W/mesa" "$W/b-mesa" ${NATIVE[@]+"${NATIVE[@]}"} -Dauto_features=disabled -Dvulkan-drivers=intel -Dgallium-drivers= -Dplatforms= \
   -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled \
-  -Dbuild-tests=false -Dtools= -Dvideo-codecs= -Dintel-rt=disabled -Dmesa-clc=enabled -Dllvm=enabled \
+  -Dbuild-tests=false -Dtools= -Dvideo-codecs=${NMX_VIDEO_CODECS:-all} -Dintel-rt=disabled -Dmesa-clc=enabled -Dllvm=enabled \
   -Dshared-llvm=enabled -Dspirv-tools=enabled -Dshader-cache=enabled -Dexpat=enabled -Dzlib=enabled \
   "-Dc_args=$MMAPINC" "-Dcpp_args=$MMAPINC" || exit 1
 ninja -C "$W/b-mesa" > "$LOG/mesa-build.log" 2>&1 || { grep -m30 -E "error|FAILED" "$LOG/mesa-build.log"; tail -40 "$LOG/mesa-build.log"; exit 1; }
@@ -115,7 +117,12 @@ install_name_tool -change "$(otool -L "$OUT/vkfill" | awk '/libvulkan/{print $1}
 clang -arch x86_64 -O2 -I"$P/include" -I"$P/include/libdrm" "$REPO/gpu-port/tools/drmlist.c" -L"$OUT" -ldrm.2 -o "$OUT/drmlist" \
   && install_name_tool -change "$(otool -L "$OUT/drmlist" | awk '/libdrm/{print $1}')" "@executable_path/libdrm.2.dylib" "$OUT/drmlist" \
   || echo "drmlist did not build"
-cp "$REPO/tools/vk/run-vk.sh" "$OUT/" && chmod +x "$OUT/run-vk.sh" "$OUT/vkfill"
+# b240: vkvideoprobe - can this GPU decode video through Vulkan Video (and does NMXGPU reach the video engine)?
+clang -arch x86_64 -O2 -I"$VKH" "$REPO/tools/vk/vkvideoprobe.c" -L"$OUT" -lvulkan.1 -Wl,-rpath,@executable_path -o "$OUT/vkvideoprobe" \
+  && install_name_tool -change "$(otool -L "$OUT/vkvideoprobe" | awk '/libvulkan/{print $1}')" "@executable_path/libvulkan.1.dylib" "$OUT/vkvideoprobe" \
+  || echo "vkvideoprobe did not build"
+cp "$REPO/tools/vk/run-vk.sh" "$REPO/tools/vk/run-vkvideo.sh" "$OUT/" && chmod +x "$OUT/run-vk.sh" "$OUT/run-vkvideo.sh" "$OUT/vkfill"
+[ -x "$OUT/vkvideoprobe" ] && chmod +x "$OUT/vkvideoprobe"
 otool -L "$OUT/libvulkan_intel.dylib" > "$LOG/anv-deps.txt"
 echo "ANV meson config:"; grep -iE "clc|llvm|intel" "$LOG/mesa-setup.log" | head -20
 ls -la "$OUT"

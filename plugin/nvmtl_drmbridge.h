@@ -27,6 +27,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <dirent.h>
+#include <sys/mman.h>
+#include <stdatomic.h>
+#include <stdio.h>
 
 #define NMXBR_MAX_FD 4096
 static io_connect_t g_br_conn[NMXBR_MAX_FD];
@@ -60,6 +63,100 @@ static io_connect_t nmxbr_conn(int fd)
 {
     if (fd < 0 || fd >= NMXBR_MAX_FD) return 0;
     return g_br_conn[fd];
+}
+
+/* b251/b252: Mesa's anonymous files (os_create_anonymous_file: mkostemp in $XDG_RUNTIME_DIR, then ftruncate + mmap
+   MAP_SHARED). Where the sandbox refuses every folder: a POSIX shared-memory object (b251). Where it refuses that too
+   (11-02: iconservicesagent, Brave's GPU process): a placeholder descriptor on /dev/null whose ftruncate allocates memory
+   and whose mmap maps that same memory again (mach_vm_remap, shared) - what Mesa needs of the file: one size, any
+   number of shared mappings. fstat reports the size; dup/close follow the descriptor. */
+#include <mach/mach_vm.h>
+#include <mach/vm_param.h>
+typedef struct { mach_vm_address_t mem; mach_vm_size_t size; int ref; } nmxbr_anon;
+static nmxbr_anon *g_anon[NMXBR_MAX_FD];
+static nmxbr_anon *nmxbr_anon_of(int fd) { return fd >= 0 && fd < NMXBR_MAX_FD ? g_anon[fd] : NULL; }
+static int nmxbr_anon_placeholder(int cloexec, int e)
+{
+    const int fd = open("/dev/null", O_RDWR | (cloexec ? O_CLOEXEC : 0));
+    if (fd < 0 || fd >= NMXBR_MAX_FD) { if (fd >= 0) close(fd); errno = e; return -1; }
+    nmxbr_anon *a = calloc(1, sizeof *a); if (!a) { close(fd); errno = ENOMEM; return -1; }
+    a->ref = 1;
+    pthread_mutex_lock(&g_br_lock); g_anon[fd] = a; pthread_mutex_unlock(&g_br_lock);
+    static int said; if (said++ < 3) nvlog("drm bridge: anon file in memory (placeholder fd %d) - no folder and no shared memory here", fd);
+    return fd;
+}
+static void nmxbr_anon_unref(nmxbr_anon *a)   /* g_br_lock held */
+{
+    if (a && --a->ref <= 0) { if (a->mem) mach_vm_deallocate(mach_task_self(), a->mem, a->size); free(a); }
+}
+static int nmxbr_anon_shm(int cloexec, int e)
+{
+    static _Atomic unsigned seq;
+    char nm[32]; snprintf(nm, sizeof nm, "/nvmtl%d.%u", (int)getpid(), atomic_fetch_add(&seq, 1));
+    const int fd = shm_open(nm, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) return nmxbr_anon_placeholder(cloexec, e);
+    static int said; if (said++ < 3) nvlog("drm bridge: anon file refused here (%s) - shared memory %s", strerror(e), nm);
+    shm_unlink(nm);
+    if (cloexec) fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return fd;
+}
+/* b253: a sandbox may let a file be created but not sized (ftruncate is checked as file-write-data): such a file is
+   given up at once (closed, removed) and the fallbacks used instead */
+static int nmxbr_sizable(int fd, const char *path)
+{
+    if (ftruncate(fd, 4096) == 0) { ftruncate(fd, 0); return 1; }
+    const int e = errno; close(fd); unlink(path);
+    static int said; if (said++ < 3) nvlog("drm bridge: anon file created but cannot be sized here (%s)", strerror(e));
+    errno = e; return 0;
+}
+static int nmxbr_hook_mkostemp(char *t, int flags)
+{
+    const int fd = mkostemp(t, flags);
+    if (fd >= 0) { if (nmxbr_sizable(fd, t)) return fd; return nmxbr_anon_shm((flags & O_CLOEXEC) != 0, errno); }
+    if (errno != EPERM && errno != EACCES && errno != ENOENT && errno != EROFS) return fd;
+    return nmxbr_anon_shm((flags & O_CLOEXEC) != 0, errno);
+}
+static int nmxbr_hook_mkstemp(char *t)
+{
+    const int fd = mkstemp(t);
+    if (fd >= 0) { if (nmxbr_sizable(fd, t)) return fd; return nmxbr_anon_shm(0, errno); }
+    if (errno != EPERM && errno != EACCES && errno != ENOENT && errno != EROFS) return fd;
+    return nmxbr_anon_shm(0, errno);
+}
+static int nmxbr_hook_ftruncate(int fd, off_t len)
+{
+    pthread_mutex_lock(&g_br_lock);
+    nmxbr_anon *a = nmxbr_anon_of(fd);
+    if (!a) { pthread_mutex_unlock(&g_br_lock); return ftruncate(fd, len); }
+    int r = 0;
+    const mach_vm_size_t sz = round_page((mach_vm_size_t)(len > 0 ? len : 0));
+    if (sz > a->size) {   /* grow: new zeroed memory, the old contents copied (Mesa sizes it once, before mapping) */
+        mach_vm_address_t m = 0;
+        if (mach_vm_allocate(mach_task_self(), &m, sz, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) { errno = ENOMEM; r = -1; }
+        else {
+            if (a->mem) { memcpy((void *)m, (void *)a->mem, a->size); mach_vm_deallocate(mach_task_self(), a->mem, a->size); }
+            a->mem = m; a->size = sz;
+        }
+    }
+    pthread_mutex_unlock(&g_br_lock);
+    return r;
+}
+static void *nmxbr_hook_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)
+{
+    pthread_mutex_lock(&g_br_lock);
+    nmxbr_anon *a = nmxbr_anon_of(fd);
+    if (!a) { pthread_mutex_unlock(&g_br_lock); return mmap(addr, len, prot, flags, fd, off); }
+    if (off < 0 || !a->mem || (mach_vm_size_t)off + len > a->size) { pthread_mutex_unlock(&g_br_lock); errno = ENXIO; return MAP_FAILED; }
+    mach_vm_address_t at = (mach_vm_address_t)(uintptr_t)addr; vm_prot_t cur, max;
+    const kern_return_t kr = mach_vm_remap(mach_task_self(), &at, round_page(len), 0,
+                                           (flags & MAP_FIXED) ? (VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) : VM_FLAGS_ANYWHERE,
+                                           mach_task_self(), a->mem + (mach_vm_address_t)off, (flags & MAP_PRIVATE) ? TRUE : FALSE,
+                                           &cur, &max, VM_INHERIT_SHARE);
+    pthread_mutex_unlock(&g_br_lock);
+    if (kr != KERN_SUCCESS) { errno = ENOMEM; return MAP_FAILED; }
+    mach_vm_protect(mach_task_self(), at, round_page(len), FALSE,
+                    ((prot & PROT_READ) ? VM_PROT_READ : 0) | ((prot & PROT_WRITE) ? VM_PROT_WRITE : 0) | ((prot & PROT_EXEC) ? VM_PROT_EXECUTE : 0));
+    return (void *)(uintptr_t)at;
 }
 
 static int nmxbr_open(const char *path)
@@ -160,6 +257,7 @@ static int nmxbr_hook_close(int fd)
         c = g_br_conn[fd]; g_br_conn[fd] = 0; free(g_br_path[fd]); g_br_path[fd] = NULL;
         nmxbr_ref(c, -1);
     }
+    if (fd >= 0 && fd < NMXBR_MAX_FD && g_anon[fd]) { nmxbr_anon_unref(g_anon[fd]); g_anon[fd] = NULL; }   /* b252 */
     pthread_mutex_unlock(&g_br_lock);
     return close(fd);
 }
@@ -172,6 +270,8 @@ static int nmxbr_hook_fstat(int fd, struct stat *st)
     char path[256]; if (p) strlcpy(path, p, sizeof path);
     pthread_mutex_unlock(&g_br_lock);
     if (p) return stat(path, st);      /* the node itself, as libdrm expects of a DRM fd */
+    pthread_mutex_lock(&g_br_lock); nmxbr_anon *a = nmxbr_anon_of(fd); const mach_vm_size_t asz = a ? a->size : 0; pthread_mutex_unlock(&g_br_lock);
+    if (a) { const int r = fstat(fd, st); if (!r) { st->st_mode = S_IFREG | 0600; st->st_size = (off_t)asz; } return r; }   /* b252 */
     return fstat(fd, st);
 }
 
@@ -184,6 +284,7 @@ static int nmxbr_track_dup(int from, int to)
         g_br_conn[to] = c; free(g_br_path[to]); g_br_path[to] = g_br_path[from] ? strdup(g_br_path[from]) : NULL;
         nmxbr_ref(c, 1);
     }
+    if (to < NMXBR_MAX_FD && nmxbr_anon_of(from)) { if (g_anon[to]) nmxbr_anon_unref(g_anon[to]); g_anon[to] = g_anon[from]; g_anon[to]->ref++; }   /* b252 */
     pthread_mutex_unlock(&g_br_lock);
     return to;
 }
@@ -202,34 +303,68 @@ static int nmxbr_hook_fcntl(int fd, int cmd, ...)
    so the listing is rebuilt: an empty file per node that stats as a character device, in a folder of the process's own
    temp space, and opendir returns that folder. libdrm reads only the names, then stats and opens the real
    /dev/dri/<name> - the open is refused and becomes a bridge connection as before. */
+/* b254: the /dev/dri listing for processes that may not read /dev/dri. b104-b253 rebuilt it as empty files in a temp
+   folder, but Brave's GPU sandbox may neither write nor create there (11-02: "deny file-write-data .../nvmtl-dri/card0",
+   and still no GPU after removing the folder). Now nothing is written: opendir returns a real, readable directory handle
+   (the driver's own folder) marked as a stand-in, and readdir on it hands out the node names that stat as character
+   devices under /dev/dri (stat is allowed where open is not). closedir unmarks it. */
+#define NMXBR_FAKE_DIRS 8
+static struct { DIR *d; int pos, n; char names[6][16]; struct dirent ent; } g_fake[NMXBR_FAKE_DIRS];
 static DIR *nmxbr_hook_opendir(const char *name)
 {
     DIR *d = opendir(name);
     if (d || !name || nmxbr_mode() == 0) return d;
     const int e = errno;
     if ((strcmp(name, "/dev/dri") && strcmp(name, "/dev/dri/")) || (e != EPERM && e != EACCES)) return d;
-    char tmp[900] = ""; const char *base = getenv("XDG_RUNTIME_DIR");
-    if (!base || !*base) { size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, tmp, sizeof tmp); base = (n > 0 && n <= sizeof tmp) ? tmp : getenv("TMPDIR"); }
-    if (!base || !*base) { errno = e; return NULL; }
-    char dir[1024]; const size_t bl = strlen(base);
-    snprintf(dir, sizeof dir, "%s%snvmtl-dri", base, base[bl - 1] == '/' ? "" : "/");
-    mkdir(dir, 0700);
     static const char *const nodes[] = { "card0", "card1", "renderD128", "renderD129", "renderD130", "renderD131" };
-    int listed = 0; char seen[160] = "";
+    char seen[160] = ""; int n = 0; char names[6][16];
     for (size_t i = 0; i < sizeof nodes / sizeof nodes[0]; i++) {
-        char real[64], fake[1100]; struct stat st;
-        snprintf(real, sizeof real, "/dev/dri/%s", nodes[i]); snprintf(fake, sizeof fake, "%s/%s", dir, nodes[i]);
+        char real[64]; struct stat st;
+        snprintf(real, sizeof real, "/dev/dri/%s", nodes[i]);
         if (stat(real, &st) == 0 && S_ISCHR(st.st_mode)) {
-            int fd = open(fake, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
-            if (fd >= 0) { close(fd); listed++; strlcat(seen, " ", sizeof seen); strlcat(seen, nodes[i], sizeof seen); }
-        } else unlink(fake);
+            strlcpy(names[n++], nodes[i], 16); strlcat(seen, " ", sizeof seen); strlcat(seen, nodes[i], sizeof seen);
+        }
     }
-    if (listed) d = opendir(dir);
+    if (n) {
+        d = opendir("/Library/GPUBundles/nvmtl");
+        if (!d) d = opendir("/");
+    }
+    if (d) {
+        pthread_mutex_lock(&g_br_lock);
+        int slot = -1;
+        for (int i = 0; i < NMXBR_FAKE_DIRS; i++) if (!g_fake[i].d) { slot = i; break; }
+        if (slot < 0) { pthread_mutex_unlock(&g_br_lock); closedir(d); d = NULL; }
+        else { g_fake[slot].d = d; g_fake[slot].pos = 0; g_fake[slot].n = n; memcpy(g_fake[slot].names, names, sizeof names);
+               pthread_mutex_unlock(&g_br_lock); }
+    }
     static int said; if (said++ < 4)
-        nvlog("drm bridge: opendir(/dev/dri) refused here (%s) - listing rebuilt in %s:%s -> %s", strerror(e), dir,
-              listed ? seen : " (no node stats)", d ? "ok" : "FAILED");
+        nvlog("drm bridge: opendir(/dev/dri) refused here (%s) - stand-in listing:%s -> %s", strerror(e), n ? seen : " (no node stats)", d ? "ok" : "FAILED");
     if (!d) errno = e;
     return d;
+}
+static struct dirent *nmxbr_hook_readdir(DIR *d)
+{
+    pthread_mutex_lock(&g_br_lock);
+    for (int i = 0; i < NMXBR_FAKE_DIRS; i++) if (d && g_fake[i].d == d) {
+        struct dirent *r = NULL;
+        if (g_fake[i].pos < g_fake[i].n) {
+            struct dirent *x = &g_fake[i].ent; memset(x, 0, sizeof *x);
+            x->d_ino = 1000 + (uint64_t)g_fake[i].pos; x->d_type = DT_CHR; x->d_reclen = sizeof *x;
+            strlcpy(x->d_name, g_fake[i].names[g_fake[i].pos], sizeof x->d_name); x->d_namlen = (uint16_t)strlen(x->d_name);
+            g_fake[i].pos++; r = x;
+        }
+        pthread_mutex_unlock(&g_br_lock);
+        return r;
+    }
+    pthread_mutex_unlock(&g_br_lock);
+    return readdir(d);
+}
+static int nmxbr_hook_closedir(DIR *d)
+{
+    pthread_mutex_lock(&g_br_lock);
+    for (int i = 0; i < NMXBR_FAKE_DIRS; i++) if (d && g_fake[i].d == d) g_fake[i].d = NULL;
+    pthread_mutex_unlock(&g_br_lock);
+    return closedir(d);
 }
 
 /* point one image's imports of the names below at the hooks (its indirect symbol tables, as dyld left them) */
@@ -238,6 +373,10 @@ static const struct { const char *name; void *fn; } g_br_hooks[] = {
     { "_fstat$INODE64", (void *)nmxbr_hook_fstat },
     { "_dup", (void *)nmxbr_hook_dup }, { "_fcntl", (void *)nmxbr_hook_fcntl },
     { "_opendir$INODE64", (void *)nmxbr_hook_opendir }, { "_opendir", (void *)nmxbr_hook_opendir },   /* b104 */
+    { "_readdir$INODE64", (void *)nmxbr_hook_readdir }, { "_readdir", (void *)nmxbr_hook_readdir },      /* b254 */
+    { "_closedir", (void *)nmxbr_hook_closedir },
+    { "_mkostemp", (void *)nmxbr_hook_mkostemp }, { "_mkstemp", (void *)nmxbr_hook_mkstemp },          /* b251 */
+    { "_ftruncate", (void *)nmxbr_hook_ftruncate }, { "_mmap", (void *)nmxbr_hook_mmap },                  /* b252 */
 };
 static int nmxbr_rebind_image(const struct mach_header_64 *mh, intptr_t slide)
 {
@@ -301,8 +440,9 @@ static void nmxbr_install(void)
         if (!strstr(n, "libvulkan_intel") && !strstr(n, "libdrm")) continue;
         const struct mach_header *mh = _dyld_get_image_header(i);
         if (!mh || mh->magic != MH_MAGIC_64) continue;
-        slots += nmxbr_rebind_image((const struct mach_header_64 *)mh, _dyld_get_image_vmaddr_slide(i));
-        images++;
+        const int k = nmxbr_rebind_image((const struct mach_header_64 *)mh, _dyld_get_image_vmaddr_slide(i));
+        nvlog("drm bridge: %d import slot(s) in %s", k, n);   /* b250: per image (0 = its imports are not where we look) */
+        slots += k; images++;
     }
     nvlog("drm bridge: %d import slot(s) hooked in %d image(s) in %s (mode %s)", slots, images, getprogname(),
           nmxbr_mode() == 2 ? "always" : "when /dev/dri is refused");

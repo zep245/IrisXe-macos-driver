@@ -28,6 +28,7 @@ struct StatusRow: Identifiable {
 final class Model: ObservableObject {
     @Published var folder = ""
     @Published var mesaFolder = ""   // b221: the Mesa build (full Metal plugin), chosen on its own
+    @Published var videoFolder = ""  // b249: the ffmpeg-vulkan build (video decoder), chosen on its own
     @Published var parts: [Part] = [
         Part(id: "gpu", title: "Display driver (NMXGPU.kext)", note: "screen, brightness, sleep - restart needed"),
         Part(id: "accel", title: "Accelerator (NMXAccel.kext)", note: "the right one for this macOS is picked - restart needed"),
@@ -36,6 +37,7 @@ final class Model: ObservableObject {
         Part(id: "fullplugin", title: "Metal plugin - full (Mesa build)", note: "first install on a new macOS, includes the shader reader"),
         Part(id: "xlate", title: "Shader translator", note: "libnvmtl_translate.dylib"),
         Part(id: "autoarm", title: "Acceleration at every boot (autoarm)", note: "comes with this app"),
+        Part(id: "video", title: "Hardware video decoding (ffmpeg-vulkan build)", note: "H.264, VP9, AV1 on the video engine - reopen apps"),
     ]
     @Published var status: [StatusRow] = []
     @Published var log = ""
@@ -173,10 +175,27 @@ final class Model: ObservableObject {
         }
     }
 
+    func chooseVideoFolder() {
+        guard let path = pickFolder("Choose the unzipped ffmpeg-vulkan build (GitHub artifact ffmpeg-vulkan) - it has the video decoder") else { return }
+        run(["scan", path], admin: false) { out in
+            let r = self.parseScan(out)
+            guard !(r["video"]?.path ?? "").isEmpty else {
+                self.warn("No video decoder in this folder", "This folder has no libixdec.dylib. Choose the unzipped ffmpeg-vulkan build from GitHub.")
+                return
+            }
+            self.videoFolder = path
+            if let i = self.parts.firstIndex(where: { $0.id == "video" }) {
+                self.parts[i].path = r["video"]?.path ?? ""
+                self.parts[i].date = r["video"]?.date ?? ""
+            }
+        }
+    }
+
     // fill the parts from a scan; the full plugin comes from the Mesa build once one is chosen
     private func apply(_ r: [String: (path: String, date: String)], skipFull: Bool) {
         for i in parts.indices {
             if parts[i].id == "fullplugin" && skipFull { continue }
+            if parts[i].id == "video" && !videoFolder.isEmpty { continue }
             parts[i].path = r[parts[i].id]?.path ?? ""
             parts[i].date = r[parts[i].id]?.date ?? ""
             if parts[i].path.isEmpty { parts[i].chosen = false }
@@ -211,9 +230,13 @@ final class Model: ObservableObject {
         // the full plugin first: it replaces the whole bundle, the quiet update then replaces only its program
         let picked = parts.filter { $0.chosen && !$0.path.isEmpty }
         let ordered = picked.filter { $0.id == "fullplugin" } + picked.filter { $0.id != "fullplugin" }
-        let chosen = ordered.map { ($0.id == "fullplugin" && !mesaFolder.isEmpty) ? "fullplugin@" + mesaFolder : $0.id }
+        let chosen = ordered.map { p -> String in
+            if p.id == "fullplugin" && !mesaFolder.isEmpty { return "fullplugin@" + mesaFolder }
+            if p.id == "video" && !videoFolder.isEmpty { return "video@" + videoFolder }
+            return p.id
+        }
         guard !chosen.isEmpty else { appendLog("Nothing chosen."); return }
-        let base = folder.isEmpty ? mesaFolder : folder
+        let base = !folder.isEmpty ? folder : (!mesaFolder.isEmpty ? mesaFolder : videoFolder)
         busy = true
         appendLog("Installing: " + chosen.map { $0.components(separatedBy: "@").first ?? $0 }.joined(separator: ", "))
         run(["install", base] + chosen, admin: true) { out in
@@ -293,6 +316,14 @@ struct ContentView: View {
                             .help(m.mesaFolder)
                         Spacer()
                         Button("Choose Mesa ANV Build...") { m.chooseMesaFolder() }
+                    }
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Video build").bold().frame(width: 120, alignment: .leading)
+                        Text(m.videoFolder.isEmpty ? "not chosen - hardware video decoding (ffmpeg-vulkan)" : (m.videoFolder as NSString).lastPathComponent)
+                            .lineLimit(1).truncationMode(.middle).foregroundStyle(m.videoFolder.isEmpty ? .secondary : .primary)
+                            .help(m.videoFolder)
+                        Spacer()
+                        Button("Choose Video Build...") { m.chooseVideoFolder() }
                     }
                     Divider()
                     ForEach($m.parts) { $p in

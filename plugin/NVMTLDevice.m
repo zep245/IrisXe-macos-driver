@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <os/log.h>
 #include <os/lock.h>
 #include <unistd.h>
 #include <stdint.h>
@@ -114,7 +115,13 @@ void nvlog(const char *fmt, ...) {
     if (rep) snprintf(t, sizeof t, "%s   [logged %llu times now]", b, (unsigned long long)rep);
     else     snprintf(t, sizeof t, "%s", b);
 #if NVMTL_RELEASE
-    if (nvmtl_log_failure(t)) syslog(LOG_ERR, "NullMoth: %s", t);
+    /* b252: os_log - Chromium's GPU sandbox refuses the syslog socket, so Brave's GPU process logged nothing (11-02) */
+    if (nvmtl_log_failure(t)) {
+        os_log_error(OS_LOG_DEFAULT, "NullMoth: %{public}s", t);
+        /* b255: Brave's GPU process reaches no log at all, but started from Terminal its stderr does */
+        static int se = -1; if (se < 0) se = getenv("NVMTL_LOG_STDERR") != NULL;
+        if (se) fprintf(stderr, "NullMoth[%s %d]: %s\n", getprogname(), getpid(), t);
+    }
 #else
     syslog(LOG_NOTICE, "NVMTL: %s", t);
     FILE *f = fopen(nvmtl_log_path(), "a");
@@ -229,6 +236,33 @@ static void nvmtl_nvdec_register(void)
         int32_t st = reg('avc1', (__bridge CFDictionaryRef)info, fac);
         nvlog("nvdec: H.264 decoder %s in %s (VTRegisterVideoDecoderWithInfo -> %d, rating 1000, %s)",
               st ? "NOT registered" : "REGISTERED", me, (int)st, path);
+    });
+}
+/* b249: Iris Xe hardware video decoding (H.264, VP9, AV1) for VideoToolbox in this app. libixdec.dylib sits next to the
+   plugin with its FFmpeg libraries and makes its own Vulkan device on the same ANV driver, with the video queue, the first
+   time a video starts. It registers only what the video engine answers for. Off: /Library/GPUBundles/nvmtl-novideo. */
+static void nvmtl_ixdec_register(void)
+{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *me = getprogname();
+        if (!nvmtl_video_on()) { nvlog("ixdec: video decoding off (nvmtl-novideo / NVMTL_NO_VIDEO, or WindowServer) in %s", me); return; }
+        void *gipa = nvmtl_vk_gipa();
+        if (!gipa) return;
+        Dl_info di;
+        if (!dladdr((const void *)nvmtl_ixdec_register, &di) || !di.dli_fname) { nvlog("ixdec: dladdr failed - not registering"); return; }
+        char dir[1024], path[1200];
+        strlcpy(dir, di.dli_fname, sizeof dir);
+        snprintf(path, sizeof path, "%s/libixdec.dylib", dirname(dir));
+        if (access(path, R_OK) != 0) { nvlog("ixdec: %s not installed - apps use Apple's software decoder", path); return; }
+        void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (!h) { nvlog("ixdec: dlopen %s FAILED: %s", path, dlerror()); return; }
+        int (*reg)(void *, int) = (int (*)(void *, int))dlsym(h, "IXDec_Register");
+        if (!reg) { nvlog("ixdec: %s has no IXDec_Register", path); return; }
+        void (*setlog)(void (*)(const char *, ...)) = (void (*)(void (*)(const char *, ...)))dlsym(h, "IXDec_SetLog");
+        if (setlog) setlog(nvlog);
+        const int n = reg(gipa, 1000);
+        nvlog("ixdec: %d codec(s) registered with VideoToolbox in %s (%s)", n, me, path);
     });
 }
 static void nvmtl_nvenc_register(void)
@@ -413,6 +447,7 @@ static void nvmtl_install_hw_resource_pools(id dev)
         nvmtl_nvdec_hevc_register();
         nvmtl_nvenc_hevc_register();
     }
+    else if (nvmtl_vk_vendor() == 0x8086) nvmtl_ixdec_register();   /* b249: the Iris Xe video engine through Vulkan Video */
     SEL il = sel_registerName("initLimits");
     if ([self respondsToSelector:il]) {
         ((void (*)(id, SEL))objc_msgSend)(self, il);

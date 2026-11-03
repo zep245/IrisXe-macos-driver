@@ -4,6 +4,8 @@ An experimental GPU driver that gives an 11th-gen **Intel Iris Xe (Tiger Lake, `
 **Metal acceleration on macOS Sequoia and Tahoe** (Hackintosh / OpenCore, x86_64). macOS has never supported this GPU: Apple's
 last Intel graphics drivers stop at Ice Lake.
 
+If this driver is useful to you, you can support the work here: [buymeacoffee.com/zep245](https://buymeacoffee.com/zep245)
+
 It is built on Intel's own open-source Linux display driver (**i915**, through FreeBSD's `drm-kmod`) running inside the
 macOS kernel, Mesa's **ANV** Vulkan driver, and a Metal-to-Vulkan layer that macOS loads as its Metal driver.
 
@@ -20,7 +22,7 @@ kernel-port design, the Metal plugin and the shader translator come from NullMot
 | | |
 |---|---|
 | Laptop | Xiaomi Mi Notebook Pro, Core i5-11300H, Iris Xe `8086:9A49`, 2560x1600 eDP panel |
-| macOS | Sequoia 15.8.1 and Tahoe 26.7.1 (same laptop, two volumes), SMBIOS `MacBookPro16,2`, OpenCore |
+| macOS | Sequoia 15.8.1 (daily), SMBIOS `MacBookPro16,2`, OpenCore. Tahoe 26.7.1 was tested on the same laptop until 2026-11-01; builds are still made for it |
 | Desktop | 1680x1050 (scaled), accelerated |
 
 Other Tiger Lake Iris Xe / UHD laptops may work; nothing else has been tested.
@@ -36,7 +38,8 @@ the artifact's `out/NMXAccel.kext` is for Sequoia, `out/tahoe/NMXAccel.kext` for
 | Boot | Apple logo kept on screen until the accelerated desktop is ready (no black gap, no second logo) |
 | Acceleration | WindowServer composites with Metal on the Iris Xe; frames reach the panel by page flip at vblank |
 | Metal apps | Through the Metal plugin, per app allow-list (`/Library/GPUBundles/nvmtl-allow.txt`); reports Metal 3 |
-| Browsers | Brave (Skia Graphite) and Safari: text, scrolling, video |
+| Browsers | Brave (Skia Graphite) and Safari: text, scrolling, video. Brave runs on the GPU with its GPU sandbox on |
+| Video decoding | H.264 and AV1 on the Iris Xe video engine for apps that use VideoToolbox (Brave/YouTube tested): 1080p, every picture identical to Apple's software decoder, ~72 % less processor time. VP9 stays on the processor (see Known issues) |
 | Camera apps | Photo Booth (incl. Effects), QuickTime, browser cameras |
 | Power | GPU idles in RC6 (0 MHz when idle), clock governor 300-1300 MHz, panel self refresh (PSR1) once accelerated |
 | Sleep / wake | Lid, Apple menu and display sleep; acceleration and PSR come back after wake |
@@ -47,8 +50,12 @@ Measured on the tested machine, idle desktop on battery at 11 % brightness: abou
 ### Known issues
 
 - Photo Booth: the delete badge on photos in the strip draws as a black square.
-- After a restart the desktop shows ~6 s of black with the pointer before the lock screen: macOS's display server is
+- After a restart the screen is black for about 1 s before the lock screen (was ~6 s): macOS's display server is
   restarted once, accelerated, because the driver loads after it starts.
+- Hardware VP9 decoding hangs the Tiger Lake video engine in Mesa's driver, so it is off: YouTube VP9 videos decode on the
+  processor (most YouTube videos come as AV1, which is on the GPU). `nvmtl-video-vp9` turns it on for testing.
+- Safari's web pages do not get hardware video decoding: Safari's GPU process (com.apple.WebKit.GPU) cannot load the
+  Metal plugin.
 - External displays (HDMI / USB-C): mirroring of the laptop screen only, not yet tested on hardware; no extended desktop.
 - A Metal app that is not on the allow-list gets no GPU device.
 - **Tahoe is slower and warmer than Sequoia** on the same laptop: the Liquid Glass interface needs much more GPU work
@@ -94,7 +101,11 @@ GitHub Actions (the machines Apple provides there have the right Xcode):
    the Metal plugin binary, the shader translator (`--target x86_64-apple-darwin`) and the Metal test tools. Download the
    `nmxgpu-*` artifact.
 2. **"Mesa ANV + Metal plugin"** (`mesa-anv-build.yml`) builds Mesa ANV and the full `NVMTLDriver.bundle` including
-   `air-runtime/` (the shader reader). Needed once, and again only when Mesa changes.
+   `air-runtime/` (the shader reader). Needed once, and again only when Mesa changes. Mesa is built with its video
+   codecs (needed for hardware video decoding).
+3. **"FFmpeg with Vulkan Video"** (`ffmpeg-vulkan-build.yml`) builds the hardware video decoder: `libixdec.dylib` with the
+   FFmpeg libraries it uses (LGPL, shared), plus the `vtdectest` test (`run-vtdec.sh <video file>`). Download the
+   `ffmpeg-vulkan` artifact.
 
 Locally on a Mac with Xcode: `NMX_MIN_OS=14.0 gpu-port/xkpi/ci-build-intel.sh ~/nmx-build`.
 
@@ -108,7 +119,10 @@ Pinned upstream versions (bumping them means fixing the port):
 pick the unzipped NMXGPU build ("Choose NMXGPU Build...") and, for a first install on a new macOS, the unzipped Mesa ANV build
 ("Choose Mesa ANV Build...", only the full Metal plugin comes from it), tick the parts (display driver, accelerator - the right one for the running macOS is
 picked -, display helper, Metal plugin update or full plugin, shader translator, acceleration at every boot) and press
-Install; the old files are kept in `/Library/Application Support/IrisXe/backup/`. "Clear Safety Locks" removes the
+Install. "Choose Video Build..." picks the unzipped `ffmpeg-vulkan` build for the "Hardware video decoding" part (the
+decoder goes into the plugin bundle and is kept when the full plugin is reinstalled; quit and reopen apps to use it).
+The full plugin install also updates the Mesa driver in `/Library/GPUBundles/nvmtl/` (an installed shader translator
+is left in place); the old files are kept in `/Library/Application Support/IrisXe/backup/`. "Clear Safety Locks" removes the
 NVRAM guards after a hang, "Turn Acceleration On Now" arms without a restart. The same actions by hand:
 `manager/irisxe-manager.sh status | scan <folder> | install <folder> <parts> | repair | armnow`.
 
@@ -168,6 +182,9 @@ Files in `/Library/GPUBundles/` (read at run time, no rebuild):
 | `nvmtl-nolumswizzle` | Turn off the luminance swizzle for one-channel (LA08 / L008) surfaces |
 | `nvmtl-nopcache` | No on-disk pipeline cache (b214; compiled GPU programs are kept per process in the user cache folder) |
 | `nvmtl-nodynbuf` | Turns off the dynamic address table (b232): every draw whose buffers changed gets a new descriptor set again, as before b232 |
+| `nvmtl-novideo` | Turns off hardware video decoding (b249): apps decode video on the processor again. `nvmtl-novideo-h264`, `nvmtl-novideo-vp9`, `nvmtl-novideo-av1` turn off one codec |
+| `nvmtl-video-nohostmap` | Video decoding: the picture goes through a staging copy again instead of the GPU writing it straight into the app's buffer (b259) |
+| `nvmtl-video-vp9` | Turns ON hardware VP9 decoding (b258: off by default - VP9 hung the Tiger Lake video engine in a test) |
 
 ## Diagnostics
 

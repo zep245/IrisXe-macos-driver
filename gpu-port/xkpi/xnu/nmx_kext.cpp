@@ -24,6 +24,7 @@
 #include <libkern/c++/OSArray.h>
 #include <mach/kmod.h>
 #include <kern/thread_call.h>
+#include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <kern/thread.h>
 #include "nmx_port.h"
@@ -299,13 +300,18 @@ extern "C" void nmx_steps_go_quiet(const char *why)
     nmx_steps_quiet = 1;
     IOLog("NullMoth GPU: per-commit log lines off from here (%s; -nmxsteps keeps them)\n", why ? why : "?");
 }
-extern "C" void nmx_step(const char *what)
+/* b245 (boot hang 11-01, "107 commit tail: DC_OFF released"): every breadcrumb was also a firmware NVRAM write + sync,
+   ~10 ms each, ~220 per boot (the normal boot's steps are 9.5-10 ms apart; 2 s of the boot). The three recorded hangs
+   stopped at unrelated steps (07 fence wait, 50 hw_done, 107 DC_OFF released - the next step, 108, is only a queue_work
+   away), and the latest came after Windows had run: a hang inside a firmware variable write (the variable store filling
+   with ~220 stale copies per boot until the firmware reclaims it) fits all three better than any display step does.
+   Now the breadcrumb goes to NVRAM only at every 8th step, at each commit's begin, and from a 1 s watchdog when the
+   steps stop for 0.7 s (a stall leaves its step behind even when no further step comes); IOLog keeps every step.
+   Boot-arg -nmxstepsall restores a write per step. */
+static char gStepLast[96]; static volatile SInt32 gStepGen, gStepNvGen; static uint64_t gStepAt;
+static thread_call_t gStepWatch;
+static void nmx_step_nvwrite(const char *buf)
 {
-    static int seq;
-    if (nmx_steps_quiet && what && !strncmp(what, "commit", 6)) { ++seq; return; }
-    char buf[96];
-    snprintf(buf, sizeof(buf), "%02d %s", ++seq, what ? what : "?");
-    IOLog("NullMoth step: %s\n", buf);
     IODTNVRAM *n = nmx_nvram();
     if (n == nullptr)
         return;
@@ -317,6 +323,43 @@ extern "C" void nmx_step(const char *what)
     if (k) k->release();
     n->sync();
     n->release();
+}
+static void nmx_step_watch(thread_call_param_t, thread_call_param_t)
+{
+    const SInt32 g = gStepGen;
+    if (g != gStepNvGen) {
+        uint64_t now = mach_absolute_time(), ns = 0;
+        absolutetime_to_nanoseconds(now - gStepAt, &ns);
+        if (ns >= 700ull * 1000 * 1000) {
+            char buf[96]; memcpy(buf, gStepLast, sizeof buf); buf[sizeof buf - 1] = 0;
+            gStepNvGen = g;
+            nmx_step_nvwrite(buf);
+            IOLog("NullMoth step watchdog: no step for %llu ms after \"%s\" - written to NVRAM\n", ns / 1000000ull, buf);
+        }
+    }
+    if (!nmx_steps_quiet && gStepWatch) {
+        uint64_t dl; clock_interval_to_deadline(1000, kMillisecondScale, &dl); thread_call_enter_delayed(gStepWatch, dl);
+    }
+}
+extern "C" void nmx_step(const char *what)
+{
+    static int seq;
+    if (nmx_steps_quiet && what && !strncmp(what, "commit", 6)) { ++seq; return; }
+    char buf[96];
+    const int no = ++seq;
+    snprintf(buf, sizeof(buf), "%02d %s", no, what ? what : "?");
+    IOLog("NullMoth step: %s\n", buf);
+    memcpy(gStepLast, buf, sizeof buf); gStepAt = mach_absolute_time();
+    const SInt32 g = OSIncrementAtomic(&gStepGen) + 1;
+    static int all = -1;
+    if (all < 0) all = PE_parse_boot_argn("-nmxstepsall", nullptr, 0) ? 1 : 0;
+    if (!gStepWatch && !all && (gStepWatch = thread_call_allocate(nmx_step_watch, nullptr)) != nullptr) {
+        uint64_t dl; clock_interval_to_deadline(1000, kMillisecondScale, &dl); thread_call_enter_delayed(gStepWatch, dl);
+    }
+    if (!all && (no % 8) != 0 && !(what && !strncmp(what, "commit begin", 12)) && no > 2)
+        return;
+    gStepNvGen = g;
+    nmx_step_nvwrite(buf);
 }
 
 

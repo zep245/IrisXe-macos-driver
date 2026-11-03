@@ -18,7 +18,8 @@ static inline int nvmtl_log_fault_word(const char *text, const char *word)
  * such as "vkCreateDevice -> -8" do not contain the word FAIL. */
 static inline int nvmtl_log_failure(const char *text)
 {
-    return text && (strstr(text, "FAIL") || strstr(text, "REFUS") ||
+    return text && (strstr(text, "FAIL") || strstr(text, "[stat]") ||   /* b233: rare statistics lines */ strstr(text, "ixdec:") ||   /* b249: video decoder, a few lines per video */
+                    strstr(text, "drm bridge:") || strstr(text, "zero physical") || strstr(text, "did not come up") || strstr(text, "XDG_RUNTIME_DIR") ||   /* b250: sandboxed GPU processes (Brave) */ strstr(text, "REFUS") ||
                     nvmtl_log_fault_word(text, "fault") ||
                     nvmtl_log_fault_word(text, "FAULT") || strstr(text, "-> -") ||
                     strstr(text, "missing") || strstr(text, "cannot") ||

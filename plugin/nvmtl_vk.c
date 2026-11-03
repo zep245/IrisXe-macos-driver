@@ -116,6 +116,13 @@ static inline const char *nvmtl_icd_lib_path(void) {
 #define NVMTL_ICD_LIB nvmtl_icd_lib_path()
 
 static void *g_lib;
+/* b249: hardware video decoding (libixdec) in GPU apps on Intel; off with /Library/GPUBundles/nvmtl-novideo or NVMTL_NO_VIDEO */
+int nvmtl_video_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = !getenv("NVMTL_NO_VIDEO") && access("/Library/GPUBundles/nvmtl-novideo", F_OK) != 0 && strcmp(getprogname(), "WindowServer") != 0;
+    return on;
+}
 static int g_sample_loader_unwrapped;
 static VkInstance g_inst; static VkPhysicalDevice g_pdev; static VkDevice g_dev; static VkQueue g_queue;
 static int g_host_query_reset, g_occlusion_precise;
@@ -241,6 +248,7 @@ static uint32_t g_dsr_depth_modes, g_dsr_stencil_modes, g_dsr_indep, g_dsr_indep
 static void *nvmtl_rp_shape_variant(nvk_pipeline *p, uint32_t load, uint32_t prm, uint32_t dmode, uint32_t smode);
 #define DECL(f) static PFN_##f p##f;
 static PFN_vkGetInstanceProcAddr pvkGetInstanceProcAddr; static PFN_vkCreateInstance pvkCreateInstance;
+void *nvmtl_vk_gipa(void) { return (void *)pvkGetInstanceProcAddr; }   /* b249: the driver entry, for libixdec */
 INSTANCE_FNS(DECL) DEVICE_FNS(DECL)
 #undef DECL
 #define LOAD_I(f) do { p##f = (PFN_##f)pvkGetInstanceProcAddr(g_inst, #f); if (!p##f) { nvlog("vk: missing %s", #f); return -1; } } while (0);
@@ -717,14 +725,39 @@ static int nvmtl_vk_initialize(void)
     /* b82: Mesa's anonymous files (ANV device creation) go to $XDG_RUNTIME_DIR, else /tmp/xdg-runtime-mesa-<uid>, which
        it refuses when the owner is not the caller: WindowServer (uid 0, euid 88) failed vkCreateDevice with
        "/tmp/xdg-runtime-mesa-0 exists but has wrong owner" (10-19). Point it at this process's own temp folder. */
+    /* b251: the folder is now chosen by really creating a file in it (access() said yes where the sandbox then refused:
+       11-02 iconservicesagent "mkdir /tmp/xdg-runtime-mesa-501 failed: Operation not permitted" -> vkCreateDevice FAILED,
+       and the newer ANV needs its anonymous file while the device is made). Candidates: the per-user temp folder, the
+       per-user cache folder (Metal's own caches live there, so GPU sandboxes - Chromium's - allow it), $TMPDIR,
+       ~/Library/Caches. If none takes a file, XDG_RUNTIME_DIR still points at the temp folder (never /tmp/xdg-runtime-mesa-*)
+       and the bridge's mkostemp/mkstemp hooks give Mesa a POSIX shared-memory file instead (nvmtl_drmbridge.h). */
     if (!getenv("XDG_RUNTIME_DIR")) {
-        char td[PATH_MAX];
-        const size_t tn = confstr(_CS_DARWIN_USER_TEMP_DIR, td, sizeof td);
-        if (tn > 0 && tn <= sizeof td && access(td, W_OK) == 0) {
-            size_t l = strlen(td); if (l > 1 && td[l - 1] == '/') td[l - 1] = 0;
-            setenv("XDG_RUNTIME_DIR", td, 1);
-            nvlog("vk: XDG_RUNTIME_DIR for Mesa = %s (%s)", td, getprogname());
+        char cand[4][PATH_MAX]; int nc = 0; char td[PATH_MAX];
+        size_t tn = confstr(_CS_DARWIN_USER_TEMP_DIR, td, sizeof td);
+        if (tn > 0 && tn <= sizeof td) snprintf(cand[nc++], PATH_MAX, "%s", td);
+        tn = confstr(_CS_DARWIN_USER_CACHE_DIR, td, sizeof td);
+        if (tn > 0 && tn <= sizeof td) snprintf(cand[nc++], PATH_MAX, "%s/nvmtl-xdg", td);
+        const char *e = getenv("TMPDIR"); if (e && *e) snprintf(cand[nc++], PATH_MAX, "%s", e);
+        e = getenv("HOME"); if (e && *e) snprintf(cand[nc++], PATH_MAX, "%s/Library/Caches/nvmtl-xdg", e);
+        int pick = -1;
+        for (int i = 0; i < nc && pick < 0; i++) {
+            size_t l = strlen(cand[i]); while (l > 1 && cand[i][l - 1] == '/') cand[i][--l] = 0;
+            mkdir(cand[i], 0700);
+            char t[PATH_MAX + 32]; snprintf(t, sizeof t, "%s/.nvmtl-XXXXXX", cand[i]);
+            const int fd = mkstemp(t);
+            if (fd >= 0) { if (ftruncate(fd, 4096) == 0) pick = i; close(fd); unlink(t); }   /* b253: sizable too */
         }
+        if (pick >= 0) { setenv("XDG_RUNTIME_DIR", cand[pick], 1); nvlog("vk: XDG_RUNTIME_DIR for Mesa = %s (%s)", cand[pick], getprogname()); }
+        else if (nc) { setenv("XDG_RUNTIME_DIR", cand[0], 1);
+            nvlog("drm bridge: anon dir: no folder takes a file in %s - Mesa's anonymous files go to shared memory", getprogname()); }
+    }
+    if (nvmtl_vk_vendor() == 0x8086 && nvmtl_video_on()) {
+        /* b249: ANV shows its video engine (the decode queue) only when asked; set before the driver's first instance so the
+           decoder (libixdec, its own device on the same driver) finds it. The plugin's own device keeps its graphics queue. */
+        setenv("ANV_VIDEO_DECODE", "1", 1);
+        const char *d = getenv("ANV_DEBUG");
+        if (!d || !*d) setenv("ANV_DEBUG", "video-decode", 1);
+        else if (!strstr(d, "video-decode")) { char b[512]; snprintf(b, sizeof b, "%s,video-decode", d); setenv("ANV_DEBUG", b, 1); }
     }
     g_lib = dlopen(NVMTL_ICD_LIB, RTLD_NOW | RTLD_LOCAL);
     if (g_lib && nvmtl_vk_vendor() != 0x10de) nmxbr_install();   /* b80: /dev/dri over IOKit where a sandbox refuses it */
@@ -2277,17 +2310,54 @@ static int nvmtl_spirv_bmask(const void *p, size_t n, uint64_t out[4])
     const uint32_t *w = (const uint32_t *)p; size_t nw = n / 4;
     memset(out, 0, 4 * sizeof *out);
     if (!p || nw < 5 || w[0] != 0x07230203u) return 0;
+    /* b234: the bindless heap is set 2, binding 0. Counted as "binding 0" it looked like buffer 0 of the stage's set:
+       every bindless shader then seemed to read a buffer descriptor and a setBytes at index 0 forced a new set
+       (b233 [stat] 10-30: ~80 % of the new sets, "changed-descriptor" + "buffer-descriptors"). Skip set-2 variables. */
+    const uint32_t bound = w[3];
+    uint8_t *heap = bound && bound < (1u << 24) ? (uint8_t *)calloc(bound, 1) : NULL;
+    if (!heap) return 0;
     for (size_t i = 5; i < nw; ) {
         uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
-        if (!wc || i + wc > nw) return 0;
-        if (op == 71 && wc == 4 && w[i + 2] == 33) {
+        if (!wc || i + wc > nw) break;
+        if (op == 71 && wc == 4 && w[i + 2] == 34 && w[i + 3] == 2 && w[i + 1] < bound) heap[w[i + 1]] |= 1;
+        if (op == 71 && wc == 4 && w[i + 2] == 33 && w[i + 1] < bound) heap[w[i + 1]] |= 2;   /* has a binding */
+        i += wc;
+    }
+    /* b237: a buffer variable the functions never touch is not read as a descriptor. Buffers reach shaders through the
+       address table; b236 [stat] 10-31 showed fragment masks still naming buffers 0-8, which then forced a new set
+       whenever one of them moved. Any word in a function that equals the variable's id counts as a use (a constant
+       that happens to match only keeps the binding - the safe side). */
+    int infn = 0;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
+        if (!wc || i + wc > nw) break;
+        if (op == 54) infn = 1;
+        if (infn) for (uint32_t k = 1; k < wc; k++) { uint32_t v = w[i + k]; if (v < bound && (heap[v] & 2)) heap[v] |= 4; }
+        i += wc;
+    }
+    unsigned unused = 0;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
+        if (!wc || i + wc > nw) { free(heap); return 0; }
+        if (op == 71 && wc == 4 && w[i + 2] == 33 && w[i + 1] < bound && !(heap[w[i + 1]] & 4) && w[i + 3] < NVMTL_NBUF) { unused++; i += wc; continue; }
+        if (op == 71 && wc == 4 && w[i + 2] == 33 && !(w[i + 1] < bound && (heap[w[i + 1]] & 1))) {
             uint32_t b = w[i + 3];
             if (b == NVMTL_ADDRESS_BINDING_NUMBER) out[NVMTL_ADDRESS_BINDING >> 6] |= 1ull << (NVMTL_ADDRESS_BINDING & 63);
             else if (b < NVMTL_ADDRESS_BINDING) out[b >> 6] |= 1ull << (b & 63);
-            else if (!(b >= NVMTL_STEX_BINDING_NUMBER && b < NVMTL_STEX_BINDING_NUMBER + NVMTL_NSTEX)) return 0;
+            /* b236: [[color(n)]] input attachments (192 + n) are written by the pass logic, not by the mask; before, they
+               made the whole mask unknown ("ALL"), so a Core Animation pipeline with programmable blending looked like it
+               read every buffer and texture descriptor of both stages (b235 [stat] 10-31: every logged case "ALL") */
+            else if (b >= NVMTL_FETCH_BINDING && b < NVMTL_FETCH_BINDING + NVMTL_NCOL) { }
+            else if (!(b >= NVMTL_STEX_BINDING_NUMBER && b < NVMTL_STEX_BINDING_NUMBER + NVMTL_NSTEX)) {
+                static _Atomic int said;
+                if (atomic_fetch_add(&said, 1) < 6) nvlog("[stat] b236 mask unknown: a module declares binding %u (no band) - its stage reads ALL", b);
+                free(heap); return 0;
+            }
         }
         i += wc;
     }
+    free(heap);
+    if (unused) { static _Atomic int said; if (atomic_fetch_add(&said, 1) < 4) nvlog("[stat] b237 mask: %u buffer binding(s) declared but never used - not counted", unused); }
     return 1;
 }
 enum { NVMTL_SLOT_NONE = 0, NVMTL_SLOT_BUF, NVMTL_SLOT_TEX, NVMTL_SLOT_SAMP, NVMTL_SLOT_TEXBUF  };
@@ -2300,14 +2370,22 @@ static int nvmtl_dirty_only_on(void)
         nvlog("vk: dirty-only bindings %s (NVMTL_NO_DIRTYONLY=%s)", on ? "ON - unchanged descriptors are copied, unchanged argument-buffer tables skipped" : "OFF", e ? e : "unset"); }
     return on;
 }
+#define NVMTL_SC_N 4
+#define NVMTL_SC_MAX 32
+typedef struct { VkDescriptorSet set; unsigned idx; uint32_t hi, n; uint64_t w[4]; VkBuffer tbuf;
+                 uint16_t bind[NVMTL_SC_MAX]; uint8_t kind[NVMTL_SC_MAX]; void *h[NVMTL_SC_MAX]; size_t off[NVMTL_SC_MAX]; } nvmtl_sc_e;
 typedef struct { nvmtl_slot s[2][NVMTL_NBIND];
                  uint8_t dirty[2]; VkDescriptorSet last[2]; unsigned last_idx[2]; uint32_t last_hi[2]; uint64_t lastw[2][4];
                  uint64_t chg[2][4]; uint64_t texgen[2]; const void *emb_fn[2]; uint64_t emb_gen[2]; uint32_t emb_n[2];
                  uint64_t emb_key[2][NVMTL_EMB_KEYMAX];
-                 /* b232: hard[] = a non-buffer binding changed since the stage's set was made (a buffer-only change can
-                    keep the set: the shaders read buffers through the address table, which is re-snapshotted and reached
-                    by a dynamic offset); last_tbuf/last_dyn = the table page that set's binding 640 points at, and its offset */
-                 uint8_t hard[2]; VkBuffer last_tbuf[2]; uint32_t last_dyn[2]; } nvmtl_bindtable;
+                 /* b232: hard[] = something outside the binding slots changed (a new pass's input attachments); a change
+                    of slots the pipeline does not read as descriptors (buffers and bindless textures reach shaders through
+                    the address table, re-snapshotted and reached by a dynamic offset) keeps the set (b233: per binding,
+                    from chg[]); last_tbuf/last_dyn = the table page that set's binding 640 points at, and its offset */
+                 uint8_t hard[2]; VkBuffer last_tbuf[2]; uint32_t last_dyn[2];
+                 /* b239: the last few sets of each stage and what they hold, so a draw that goes back to an earlier
+                    combination (Core Animation alternates samplers between draws) takes that set again */
+                 nvmtl_sc_e sc[2][NVMTL_SC_N]; uint32_t sc_next[2]; } nvmtl_bindtable;
 
 static VkDescriptorSetLayout g_setLayout;
 #define NVMTL_MAX_POOLS 64
@@ -2515,6 +2593,19 @@ static int nvmtl_table_ubo(void)
    WindowServer's CPU while scrolling, Tahoe 10-30 sample). Off: touch /Library/GPUBundles/nvmtl-nodynbuf (or
    NVMTL_NO_DYNTABLE=1). Needs the Uniform table (nvmtl_table_ubo). */
 static unsigned long long g_dyn_reuse, g_dyn_new;
+/* b233: why a stage set was kept or made, logged now and then in the quiet build too ("[stat]" passes its filter):
+   0 kept (nothing changed), 1 kept (b232/b233 table-only change), 2 new, rejected because 3 pass change, 4 a changed
+   binding the pipeline reads as a descriptor, 5 the pipeline reads buffer descriptors, 6 not covered / storage
+   textures, 7 the table page changed */
+static _Atomic unsigned long long g_dynwhy[9];   /* b239: 8 = kept from the recent-set cache */
+static void nvmtl_dyn_stat(int k)
+{
+    const unsigned long long n = atomic_fetch_add(&g_dynwhy[k], 1) + 1;
+    if (k != 2 || n < 4096 || (n & (n - 1))) return;
+    nvlog("[stat] b239 descriptor sets: kept %llu, kept-table-only %llu, kept-cache %llu, new %llu | new because: pass %llu, changed-descriptor %llu, not-covered %llu, new-page %llu",
+          (unsigned long long)g_dynwhy[0], (unsigned long long)g_dynwhy[1], (unsigned long long)g_dynwhy[8], n, (unsigned long long)g_dynwhy[3],
+          (unsigned long long)g_dynwhy[4], (unsigned long long)g_dynwhy[6], (unsigned long long)g_dynwhy[7]);
+}
 static int nvmtl_dyntable_on(void)
 {
     static int v = -1;
@@ -2746,7 +2837,7 @@ static int nvmtl_bind_slot(nvk_cmdbuf *c, uint32_t set, uint32_t binding, uint8_
     if (sl->kind != kind || sl->h != h || sl->off != off) {
         t->dirty[set] = 1;
         t->chg[set][binding >> 6] |= 1ull << (binding & 63);
-        if (kind != NVMTL_SLOT_BUF || sl->kind != NVMTL_SLOT_BUF) { t->texgen[set]++; t->hard[set] = 1; }
+        if (kind != NVMTL_SLOT_BUF || sl->kind != NVMTL_SLOT_BUF) t->texgen[set]++;
     }
     sl->kind = kind; sl->h = h; sl->off = off;
     return 0;
@@ -2771,7 +2862,7 @@ int nvmtl_vk_bind_buffer_offset(nvk_cmdbuf *c, uint32_t set, uint32_t index, siz
     nvmtl_bindtable *t = (nvmtl_bindtable *)c->table;
     if (t->s[set][index].kind != NVMTL_SLOT_BUF) return -1;
     if (offset >= t->s[set][index].size) { nvlog("buffer offset %zu exceeds buffer length %zu", offset, t->s[set][index].size); return -1; }
-    if (t->s[set][index].off != offset) t->dirty[set] = 1;
+    if (t->s[set][index].off != offset) { t->dirty[set] = 1; t->chg[set][index >> 6] |= 1ull << (index & 63); }   /* b238: chg too */
     t->s[set][index].off = offset;
     return 0;
 }
@@ -3173,44 +3264,137 @@ have_set:
     pvkUpdateDescriptorSets(g_dev, nw, w, ncp, cp);
     return set;
 }
+/* b239: remember a stage set just written: the slot contents behind every binding it holds (mask w, storage textures
+   below hi). Sets holding more than NVMTL_SC_MAX bindings are not remembered. */
+static void nvmtl_sc_put(nvk_cmdbuf *c, nvmtl_bindtable *t, uint32_t which, VkDescriptorSet set, const uint64_t w[4], uint32_t hi, VkBuffer tbuf)
+{
+    nvmtl_sc_e *e = &t->sc[which][t->sc_next[which] % NVMTL_SC_N];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < NVMTL_NBIND; i++) {
+        const int inw = i < 256 && ((w[i >> 6] >> (i & 63)) & 1);
+        const int instex = i >= NVMTL_STEX_BASE && i - NVMTL_STEX_BASE < hi;
+        if (!inw && !instex) continue;
+        if (n == NVMTL_SC_MAX) { e->set = VK_NULL_HANDLE; return; }
+        e->bind[n] = (uint16_t)i; e->kind[n] = t->s[which][i].kind; e->h[n] = t->s[which][i].h; e->off[n] = t->s[which][i].off; n++;
+    }
+    e->set = set; e->idx = c->nsets - 1; e->hi = hi; e->n = n; e->tbuf = tbuf; memcpy(e->w, w, sizeof e->w);
+    t->sc_next[which]++;
+}
+/* b239: a remembered set of this command buffer that holds, unchanged, every binding the pipeline reads (pm) and its
+   storage textures (below hi). Returns its index or -1; *ok gets the bindings of w that still match the slots. */
+static int nvmtl_sc_find(nvk_cmdbuf *c, nvmtl_bindtable *t, uint32_t which, const uint64_t *pm, uint32_t hi, VkBuffer tbuf, int addr, uint64_t ok[4])
+{
+    for (uint32_t r = 0; r < NVMTL_SC_N; r++) {
+        nvmtl_sc_e *e = &t->sc[which][(t->sc_next[which] + NVMTL_SC_N - 1 - r) % NVMTL_SC_N];
+        if (!e->set || e->idx >= c->nsets || (VkDescriptorSet)c->sets[e->idx].set != e->set || e->hi < hi) continue;
+        if (addr && e->tbuf != tbuf) continue;
+        int cov = 1;
+        for (int k = 0; k < 4; k++) if (pm[k] & ~e->w[k]) cov = 0;
+        if (!cov) continue;
+        uint64_t m[4] = { 0, 0, 0, 0 }; int stexbad = 0;
+        for (uint32_t k = 0; k < e->n; k++) {
+            const uint32_t i = e->bind[k]; const nvmtl_slot *sl = &t->s[which][i];
+            const int same = sl->kind == e->kind[k] && sl->h == e->h[k] && sl->off == e->off[k];
+            if (i >= NVMTL_STEX_BASE && i - NVMTL_STEX_BASE < hi && !same) { stexbad = 1; break; }
+            if (same && i < 256 && ((e->w[i >> 6] >> (i & 63)) & 1)) m[i >> 6] |= 1ull << (i & 63);
+        }
+        if (stexbad) continue;
+        int good = 1;
+        for (int k = 0; k < 4; k++) if (pm[k] & ~m[k]) good = 0;
+        if (!good) continue;
+        memcpy(ok, m, sizeof m);
+        return (int)((t->sc_next[which] + NVMTL_SC_N - 1 - r) % NVMTL_SC_N);
+    }
+    return -1;
+}
 static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const nvk_pipeline *p)
 {
     nvmtl_bindtable *t = (nvmtl_bindtable *)c->table;
     if (!t || which > 1 || !nvmtl_enc78_on(NVMTL_E78_H3) || p->tbany) return nvmtl_snapshot_set_t(c, which, p->stex_hi[which], p->tbany ? p->tbm[which] : NULL);
     const uint64_t all[4] = { ~0ull, ~0ull, ~0ull, ~0ull };
-    const uint64_t *pm = p->bmask_ok ? p->bmask : (p->gmask_ok && which < 2) ? p->gmask[which] : all;
+    const uint64_t *pm = p->bmask_ok ? p->bmask : (which < 2 && ((p->gmask_ok >> which) & 1)) ? p->gmask[which] : all;
     uint32_t hi = p->stex_hi[which];
     int live = t->last[which] && !t->dirty[which] && t->last_idx[which] < c->nsets
                && (VkDescriptorSet)c->sets[t->last_idx[which]].set == t->last[which];
     if (live && hi <= t->last_hi[which]) {
         int covered = 1;
         for (int k = 0; k < 4; k++) if (pm[k] & ~t->lastw[which][k]) covered = 0;
-        if (covered) { nvmtl_enc78_count(E78C_SETREUSE, 1); c->dyn[which] = t->last_dyn[which]; return t->last[which]; }
+        if (covered) { nvmtl_enc78_count(E78C_SETREUSE, 1); c->dyn[which] = t->last_dyn[which]; nvmtl_dyn_stat(0); return t->last[which]; }
     }
-    /* b232: only buffer bindings changed since the last set, and this pipeline reads no buffer descriptor directly (its
-       buffers come from the address table): keep the set, give it a fresh table snapshot through the dynamic offset */
+    /* b232/b233: the bindings that changed since the last set are ones this pipeline does not read as descriptors (its
+       buffers and its 2D textures come from the address table - bindless-all), so keep the set and give it a fresh
+       table snapshot through the dynamic offset */
     VkDescriptorBufferInfo pre; int havepre = 0;
-    if (!live && !t->hard[which] && t->last[which] && t->last_idx[which] < c->nsets
-        && (VkDescriptorSet)c->sets[t->last_idx[which]].set == t->last[which] && hi <= t->last_hi[which]
-        && !(pm[0] & 0xffffffffull) && nvmtl_dyntable_on()) {
-        int covered = 1;
-        for (int k = 0; k < 4; k++) if (pm[k] & ~t->lastw[which][k]) covered = 0;
+    if (!live && t->last[which] && t->last_idx[which] < c->nsets
+        && (VkDescriptorSet)c->sets[t->last_idx[which]].set == t->last[which] && nvmtl_dyntable_on()) {
+        int why = 0, covered = 1, hit = 0;
+        for (int k = 0; k < 4; k++) { if (pm[k] & ~t->lastw[which][k]) covered = 0; if (pm[k] & t->chg[which][k]) hit = 1; }
+        /* storage textures are written by range (0..hi-1), not by mask: any change there needs a new set */
+        int stexchg = 0;
+        for (uint32_t j = 0; j < hi && j < NVMTL_NSTEX && !stexchg; j++) {
+            const uint32_t i = NVMTL_STEX_BASE + j;
+            if (i < 256 && ((t->chg[which][i >> 6] >> (i & 63)) & 1)) stexchg = 1;
+        }
+        if (t->hard[which]) why = 3;
+        else if (hit) why = 4;
+        /* b238: buffer slots now mark chg on every change (setBufferOffset too), so "hit" above covers the buffers the
+           pipeline reads; reason 5 is no longer used */
+        if (why == 4 || why == 5) {   /* b235: which bindings - the first few of each, in the quiet build too */
+            static _Atomic int said4, said5;
+            if (atomic_fetch_add(why == 4 ? &said4 : &said5, 1) < 6)
+                nvlog("[stat] b239 set %u new because %s: pipeline reads %#llx %#llx %#llx %#llx, changed %#llx %#llx %#llx %#llx (mask from %s, buffer slot kinds %u %u %u %u)",
+                      which, why == 4 ? "changed-descriptor" : "buffer-descriptors",
+                      (unsigned long long)pm[0], (unsigned long long)pm[1], (unsigned long long)pm[2], (unsigned long long)pm[3],
+                      (unsigned long long)t->chg[which][0], (unsigned long long)t->chg[which][1], (unsigned long long)t->chg[which][2], (unsigned long long)t->chg[which][3],
+                      p->bmask_ok ? "bmask" : ((p->gmask_ok >> which) & 1) ? "gmask" : "ALL",
+                      t->s[which][0].kind, t->s[which][1].kind, t->s[which][2].kind, t->s[which][3].kind);
+        }
+        else if (!covered || hi > t->last_hi[which] || stexchg) why = 6;
         const int addr = (pm[NVMTL_ADDRESS_BINDING >> 6] >> (NVMTL_ADDRESS_BINDING & 63)) & 1;
-        if (covered && (!addr || t->last_tbuf[which])) {
+        if (!why && addr && !t->last_tbuf[which]) why = 6;
+        if (!why) {
             if (addr && nvmtl_address_snapshot(c, which, &pre)) { c->skipped++; return VK_NULL_HANDLE; }
             if (!addr || pre.buffer == t->last_tbuf[which]) {
                 if (addr) t->last_dyn[which] = (uint32_t)pre.offset;
                 c->dyn[which] = t->last_dyn[which];
                 t->dirty[which] = 0;
-                t->lastw[which][0] &= ~0xffffffffull;   /* its buffer descriptors no longer match the slots */
+                /* the set's descriptors for the changed slots (and every buffer descriptor) no longer match them */
+                for (int k = 0; k < 4; k++) t->lastw[which][k] &= ~t->chg[which][k];
+                /* storage textures past this pipeline's range that changed: the set no longer holds them either */
+                for (uint32_t j = hi; j < t->last_hi[which] && j < NVMTL_NSTEX; j++) {
+                    const uint32_t i = NVMTL_STEX_BASE + j;
+                    if (i < 256 && ((t->chg[which][i >> 6] >> (i & 63)) & 1)) { t->last_hi[which] = hi; break; }
+                }
                 memset(t->chg[which], 0, sizeof t->chg[which]);
                 nvmtl_enc78_count(E78C_SETREUSE, 1);
-                const unsigned long long n = ++g_dyn_reuse;
-                if (!(n & (n - 1)) && n >= 64) nvlog("b232: %llu draws kept their descriptor set (buffer-only change), %llu new sets", n, g_dyn_new);
+                ++g_dyn_reuse; nvmtl_dyn_stat(1);
                 return t->last[which];
             }
             havepre = 1;   /* the table moved to a new page: a new set, with the snapshot already taken */
+            why = 7;
         }
+        if ((why == 4 || why == 6) && !t->hard[which]) {   /* b239: an earlier set of this command buffer that fits */
+            if (addr && !havepre) {
+                if (nvmtl_address_snapshot(c, which, &pre)) { c->skipped++; return VK_NULL_HANDLE; }
+                havepre = 1;
+            }
+            uint64_t okw[4];
+            const int at = nvmtl_sc_find(c, t, which, pm, hi, addr ? pre.buffer : VK_NULL_HANDLE, addr, okw);
+            if (at >= 0) {
+                nvmtl_sc_e *e = &t->sc[which][at];
+                t->last[which] = e->set; t->last_idx[which] = e->idx; t->last_hi[which] = e->hi;
+                memcpy(t->lastw[which], okw, sizeof okw);
+                t->last_tbuf[which] = e->tbuf;
+                if (addr) t->last_dyn[which] = (uint32_t)pre.offset;
+                c->dyn[which] = t->last_dyn[which];
+                t->dirty[which] = 0;
+                memset(t->chg[which], 0, sizeof t->chg[which]);
+                nvmtl_enc78_count(E78C_SETREUSE, 1);
+                nvmtl_dyn_stat(8);
+                return e->set;
+            }
+        }
+        nvmtl_dyn_stat(why);
     }
     uint64_t m[4];
     for (int k = 0; k < 4; k++) m[k] = pm[k] | (live ? t->lastw[which][k] : 0);
@@ -3229,7 +3413,8 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
     VkDescriptorSet s = nvmtl_snapshot_set_md(c, which, hi, m, NULL, from, from ? cm : NULL, havepre ? &pre : NULL, &tbuf);
     if (!s) return s;
     t->last[which] = s; t->last_idx[which] = c->nsets - 1; t->last_hi[which] = hi; t->dirty[which] = 0;
-    t->hard[which] = 0; t->last_tbuf[which] = tbuf; t->last_dyn[which] = c->dyn[which]; g_dyn_new++;
+    t->hard[which] = 0; t->last_tbuf[which] = tbuf; t->last_dyn[which] = c->dyn[which]; g_dyn_new++; nvmtl_dyn_stat(2);
+    if (nvmtl_dyntable_on()) nvmtl_sc_put(c, t, which, s, m, hi, tbuf);
     memset(t->chg[which], 0, sizeof t->chg[which]);
     memcpy(t->lastw[which], m, sizeof m);
     nvmtl_enc78_count(E78C_SETNEW, 1);
@@ -4103,7 +4288,8 @@ static int nvmtl_vk_pipeline_create_impl_lifetime_body(const void *vs, size_t vn
     if (!nvmtl_spirv_ok(vs, vn, "vertex module") || !nvmtl_spirv_ok(fs, fn, "fragment module")) return -1;
     out->fetch = samples == 1 && nvmtl_fbfetch_on() && nvmtl_spirv_uses_fetch(fs, fn);   /* b99 */
     if (out->fetch) { static unsigned said; if (said++ < 8) nvlog("vk: b99 pipeline reads [[color(n)]] - its draws read the pass's colour as an input attachment"); }
-    if (!td) out->gmask_ok = (uint32_t)(nvmtl_spirv_bmask(vs, vn, out->gmask[0]) && nvmtl_spirv_bmask(fs, fn, out->gmask[1]));
+    /* b236: per stage (bit 0 vertex, bit 1 fragment) - an unknown fragment mask no longer makes the vertex set read ALL */
+    if (!td) out->gmask_ok = (uint32_t)(nvmtl_spirv_bmask(vs, vn, out->gmask[0]) ? 1u : 0u) | (nvmtl_spirv_bmask(fs, fn, out->gmask[1]) ? 2u : 0u);
     VkShaderModuleCreateInfo vsm = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, vn, (const uint32_t *)vs };
     uint32_t *fcopy = (uint32_t *)malloc(fn);
     if (!fcopy) { nvlog("vk: out of memory copying the fragment module"); return -1; }
@@ -4955,7 +5141,8 @@ int nvmtl_vk_cmd_begin_pass(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p)
     c->fetch_rp = !rpShape && p->samples <= 1 && ncol && nvmtl_fbfetch_on();
     for (uint32_t i = 0; c->fetch_rp && i < ncol && i < NVMTL_NCOL; i++)
         if (cf[i] && ps->col[i] && (ps->col[i]->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) c->fetch_view[i] = ps->colview[i];
-    if (c->fetch_rp && c->table) { ((nvmtl_bindtable *)c->table)->dirty[1] = 1; ((nvmtl_bindtable *)c->table)->hard[1] = 1; }   /* no fragment set from another pass */
+    if (c->fetch_rp && c->table) { nvmtl_bindtable *ft = (nvmtl_bindtable *)c->table; ft->dirty[1] = 1; ft->hard[1] = 1;
+                                   memset(ft->sc[1], 0, sizeof ft->sc[1]); }   /* no fragment set from another pass (b239: nor from the cache) */
     c->fetch_pipe = p->fetch;
     if (p->pipe) pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pipe);
     VkViewport vp = { 0, (float)ps->h, (float)ps->w, -(float)ps->h, 0, 1 }; VkRect2D sc = { { 0, 0 }, { ps->w, ps->h } };

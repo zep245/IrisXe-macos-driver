@@ -1,0 +1,79 @@
+name: FFmpeg with Vulkan Video (hardware decoding test)
+
+# Manual only (b242, hardware video decoding stage 2). Builds a small FFmpeg for x86_64 macOS with the Vulkan hardware
+# decoder (H.264 / HEVC / VP9 / AV1 through Vulkan Video) and nothing it would pick up from Homebrew. Download the
+# "ffmpeg-vulkan" artifact, copy ffmpeg + run-ffvideo.sh into a Mesa build's nmx-vulkan folder and run
+# ./run-ffvideo.sh <video file> there. FFmpeg opens the Vulkan loader at run time (the folder's libvulkan.1.dylib).
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_ref:
+        description: FFmpeg tag or commit (8.0 or newer has VP9 decoding through Vulkan)
+        default: n8.0
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_UPGRADE: "1"
+          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
+        run: |
+          for p in pkgconf nasm vulkan-headers vulkan-loader; do brew install $p || echo "brew: $p not installed"; done
+      - name: Build FFmpeg
+        env:
+          REF: ${{ inputs.ffmpeg_ref }}
+        run: |
+          set -e
+          S="$RUNNER_TEMP/ffmpeg"; P="$RUNNER_TEMP/ffp"; O="$RUNNER_TEMP/out/ffmpeg-vulkan"; mkdir -p "$O"
+          git clone -q --filter=blob:none https://git.ffmpeg.org/ffmpeg.git "$S" || git clone -q --filter=blob:none https://github.com/FFmpeg/FFmpeg.git "$S"
+          git -C "$S" checkout -q "$REF"
+          cd "$S"
+          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:$(brew --prefix)/share/pkgconfig"
+          # --disable-autodetect: no Homebrew library and no VideoToolbox gets in by accident; Vulkan is header-only at
+          # build time (FFmpeg loads libvulkan when it runs). b243: shared libraries (LGPL, no --enable-gpl), found next
+          # to whatever loads them (@rpath = @loader_path), for the VideoToolbox decoder (libixdec)
+          ./configure --prefix="$P" --cc=clang --arch=x86_64 --disable-autodetect --enable-pthreads --enable-vulkan --enable-zlib \
+            --enable-shared --disable-static --install-name-dir='@rpath' --disable-avdevice \
+            --disable-doc --disable-debug --disable-ffplay --disable-network \
+            --extra-cflags="-mmacosx-version-min=14.0" --extra-ldflags="-mmacosx-version-min=14.0 -Wl,-rpath,@loader_path" > "$RUNNER_TEMP/configure.log" 2>&1 \
+            || { tail -40 "$RUNNER_TEMP/configure.log"; tail -60 ffbuild/config.log; exit 1; }
+          grep -iE "hwaccel.*vulkan|vulkan" "$RUNNER_TEMP/configure.log" | head -20
+          make -j"$(sysctl -n hw.ncpu)" > "$RUNNER_TEMP/make.log" 2>&1 || { grep -m30 -E "error" "$RUNNER_TEMP/make.log"; tail -40 "$RUNNER_TEMP/make.log"; exit 1; }
+          make install > /dev/null
+          cp "$P/bin/ffmpeg" "$P/bin/ffprobe" "$O/"
+          # each library under the name it is loaded by (its install name), not the full version
+          for f in "$P"/lib/*.dylib; do [ -L "$f" ] && continue; n=$(otool -D "$f" | tail -1); cp "$f" "$O/$(basename "$n")"; done
+          strip -x "$O"/*.dylib "$O/ffmpeg" "$O/ffprobe" || true
+          cp "$GITHUB_WORKSPACE/tools/vk/run-ffvideo.sh" "$O/"; chmod +x "$O/run-ffvideo.sh"
+          otool -L "$O/ffmpeg"; ls -la "$O"
+          DYLD_LIBRARY_PATH="$O" "$O/ffmpeg" -hide_banner -hwaccels
+          echo "### FFmpeg $REF with Vulkan Video built (shared)" >> "$GITHUB_STEP_SUMMARY"
+          echo "FFP=$P" >> "$GITHUB_ENV"
+      - name: Build the VideoToolbox decoder (libixdec) and its test (vtdectest)
+        run: |
+          set -e
+          O="$RUNNER_TEMP/out/ffmpeg-vulkan"; V="$GITHUB_WORKSPACE/tools/video"; VKH="$(brew --prefix vulkan-headers)/include"
+          clang -arch x86_64 -mmacosx-version-min=14.0 -O2 -Wall -Wno-four-char-constants -Wno-deprecated-declarations -dynamiclib \
+            -I"$V" -I"$FFP/include" -I"$VKH" "$V/ixdec_vt.c" -L"$FFP/lib" -lavcodec -lavutil \
+            -framework CoreFoundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox \
+            -install_name @rpath/libixdec.dylib -Wl,-rpath,@loader_path -o "$O/libixdec.dylib"
+          clang -arch x86_64 -mmacosx-version-min=14.0 -O2 -fobjc-arc -Wall -Wno-four-char-constants -Wno-deprecated-declarations \
+            "$V/vtdectest.m" -framework Foundation -framework AVFoundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+            -o "$O/vtdectest"
+          cp "$V/run-vtdec.sh" "$O/"; chmod +x "$O/run-vtdec.sh"
+          codesign -f -s - "$O"/*.dylib "$O/vtdectest" "$O/ffmpeg" "$O/ffprobe"
+          otool -L "$O/libixdec.dylib"
+          nm -gU "$O/libixdec.dylib" | grep -E "IXDec_"
+          echo "### libixdec.dylib + vtdectest built" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-vulkan
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn

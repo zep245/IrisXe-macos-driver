@@ -5,7 +5,8 @@
 #   irisxe-manager.sh scan <folder>             which driver parts a downloaded build folder contains (no root needed)
 #   sudo irisxe-manager.sh install <folder> <part>...   install the chosen parts from that folder
 #        (a part written part@<other folder> comes from that folder, e.g. fullplugin@<Mesa build>)
-#        parts: gpu accel agdc plugin fullplugin xlate autoarm
+#        parts: gpu accel agdc plugin fullplugin xlate autoarm video
+#        (video = the hardware video decoder from the "ffmpeg-vulkan" build: libixdec + FFmpeg libraries, b249)
 #   sudo irisxe-manager.sh repair               clear the two safety locks (after a hang); restart afterwards
 #   sudo irisxe-manager.sh armnow               turn acceleration on now (restarts the desktop, open apps close)
 #
@@ -35,6 +36,8 @@ find_part() {   # $1 folder, $2 part -> path or nothing
            find "$d" -maxdepth 6 -type d -name NVMTLDriver.bundle 2>/dev/null |
                while IFS= read -r f; do [ -f "$f/Contents/MacOS/air-runtime/libLLVM.dylib" ] && { echo "$f"; break; }; done ;;
     xlate) find "$d" -maxdepth 6 -type f -name libnvmtl_translate.dylib -not -path '*/air-runtime/*' 2>/dev/null | head -1 ;;
+    video) # b249: the folder with libixdec.dylib (the ffmpeg-vulkan artifact)
+           f=$(find "$d" -maxdepth 6 -type f -name libixdec.dylib 2>/dev/null | head -1); [ -n "$f" ] && dirname "$f" ;;
     autoarm) # b221: the helper inside the chosen build (its out/IrisXe Manager.app) first - the one bundled in THIS app
            # may be older (10-29: an app from b204 kept installing autoarm v11)
            f=$(find "$d" -maxdepth 7 -type f -path '*/helpers/nmx-autoarm/install-autoarm.sh' 2>/dev/null | head -1)
@@ -46,7 +49,7 @@ find_part() {   # $1 folder, $2 part -> path or nothing
 cmd_scan() {
     local d=${1:?folder}
     [ -d "$d" ] || { say "ERROR: no folder $d"; exit 1; }
-    for p in gpu accel agdc plugin fullplugin xlate autoarm; do
+    for p in gpu accel agdc plugin fullplugin xlate autoarm video; do
         f=$(find_part "$d" "$p")
         if [ -n "$f" ]; then say "$p=$f|$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$f" 2>/dev/null)"; else say "$p="; fi
     done
@@ -73,6 +76,11 @@ cmd_status() {
     else say "plugin|not installed|"; fi
     if [ -f "$GB/nvmtl/libnvmtl_translate.dylib" ]; then say "xlate|$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$GB/nvmtl/libnvmtl_translate.dylib")|"
     else say "xlate|not installed|"; fi
+    local V="$GB/NVMTLDriver.bundle/Contents/MacOS/libixdec.dylib"
+    if [ -f "$V" ]; then
+        local vs=on; [ -e "$GB/nvmtl-novideo" ] && vs="switched off (nvmtl-novideo)"
+        say "video|installed $(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$V")|hardware decoding $vs"
+    else say "video|not installed|apps decode video on the processor"; fi
     if [ -f /usr/local/libexec/nmx-autoarm.sh ]; then
         say "autoarm|installed ($(grep -o 'autoarm v[0-9]*' /usr/local/libexec/nmx-autoarm.sh | head -1))|$(tail -1 /var/log/nmx-autoarm.log 2>/dev/null | cut -c1-90)"
     else say "autoarm|not installed|"; fi
@@ -122,10 +130,32 @@ install_plugin_binary() {   # quiet plugin: replace only the binary (+Info.plist
     local kind=VERBOSE; grep -aq nvmtl-off.log "$D/Contents/MacOS/NVMTLDriver" && kind=QUIET
     say "  Metal plugin updated ($kind) - restart (or turn acceleration on again) to use it"
 }
+VIDEO_LIBS="libixdec.dylib libavcodec.*.dylib libavutil.*.dylib libswresample.*.dylib"
 install_plugin_full() {
     local s=$1 D="$GB/NVMTLDriver.bundle"
     backup "$D"; mkdir -p "$GB"
-    rm -rf "$D" && ditto "$s" "$D" || { say "  ERROR: copy failed"; return 1; }
+    # b249: the video decoder lives inside the bundle - keep it across a full reinstall
+    local keep; keep=$(mktemp -d)
+    (cd "$D/Contents/MacOS" 2>/dev/null && for g in $VIDEO_LIBS; do [ -f "$g" ] && cp -p "$g" "$keep/"; done)
+    rm -rf "$D" && ditto "$s" "$D" || { say "  ERROR: copy failed"; rm -rf "$keep"; return 1; }
+    if [ -n "$(ls "$keep")" ]; then cp -p "$keep"/* "$D/Contents/MacOS/" && say "  kept the video decoder"; fi
+    rm -rf "$keep"
+    # b249: the Mesa driver itself (nvmtl/ beside the bundle: libvulkan_intel, libdrm ...) - before b249 only the bundle was
+    # copied, so the driver stayed at whatever install-metal.sh put there (a driver older than b240 has no video engine).
+    # The shader translator is left alone when one is installed (the NMXGPU build's "xlate" is the newer one); caches stay.
+    local N; N="$(dirname "$s")/nvmtl"
+    if [ -f "$N/libvulkan_intel.dylib" ]; then
+        mkdir -p "$GB/nvmtl"; local n=0
+        for f in "$N"/*.dylib "$N"/*.json; do
+            [ -f "$f" ] || continue
+            local b; b=$(basename "$f"); local T="$GB/nvmtl/$b"
+            [ "$b" = libnvmtl_translate.dylib ] && [ -f "$T" ] && continue
+            backup "$T"; cp "$f" "$T.new" && mv -f "$T.new" "$T" || { say "  ERROR: copy to $T failed"; return 1; }
+            n=$((n+1))
+        done
+        chown -R root:wheel "$GB/nvmtl"; chmod -R go-w,a+rX "$GB/nvmtl"; xattr -dr com.apple.quarantine "$GB/nvmtl" 2>/dev/null
+        say "  Mesa ANV driver updated ($n files in $GB/nvmtl)"
+    else say "  NOTE: no nvmtl/ folder beside the bundle - the Mesa driver was not updated"; fi
     chown -R root:wheel "$D"; chmod -R go-w,a+rX "$D"; xattr -dr com.apple.quarantine "$D" 2>/dev/null
     [ -f "$GB/nvmtl-allow.txt" ] || printf '# processes that get the Intel Metal device (one name per line)\nmtlprobe\n' > "$GB/nvmtl-allow.txt"
     say "  full Metal plugin installed (with the shader reader)"
@@ -142,6 +172,23 @@ install_xlate() {
         fi
     done
     say "  shader translator updated"
+}
+install_video() {   # b249: libixdec + the FFmpeg libraries it uses, next to the plugin
+    local s=$1 D="$GB/NVMTLDriver.bundle/Contents/MacOS"
+    [ -d "$D" ] || { say "  ERROR: no Metal plugin installed yet - install the full plugin first"; return 1; }
+    [ -f "$s/libixdec.dylib" ] && [ -n "$(ls "$s"/libavcodec.*.dylib 2>/dev/null)" ] || { say "  ERROR: $s has no libixdec.dylib + libavcodec"; return 1; }
+    local n=0
+    for g in $VIDEO_LIBS; do
+        for f in "$s"/$g; do
+            [ -f "$f" ] || continue
+            local T="$D/$(basename "$f")"; backup "$T"
+            cp "$f" "$T.new" && mv -f "$T.new" "$T" || { say "  ERROR: copy to $T failed"; return 1; }
+            chown root:wheel "$T"; chmod 755 "$T"; xattr -d com.apple.quarantine "$T" 2>/dev/null; n=$((n+1))
+        done
+    done
+    say "  video decoder installed ($n files) - quit and reopen apps (Brave) to use it"
+    [ -e "$GB/nvmtl-novideo" ] && say "  NOTE: switched off by $GB/nvmtl-novideo - remove that file to use it"
+    return 0
 }
 cmd_install() {
     need_root
@@ -163,6 +210,7 @@ cmd_install() {
         plugin)     install_plugin_binary "$f" || fails=$((fails+1)) ;;
         fullplugin) install_plugin_full "$f" || fails=$((fails+1)) ;;
         xlate)      install_xlate "$f" || fails=$((fails+1)) ;;
+        video)      install_video "$f" || fails=$((fails+1)) ;;
         autoarm)    bash "$f/install-autoarm.sh" 2>&1 | sed 's/^/  /' ;;
         esac
     done
