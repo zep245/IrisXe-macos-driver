@@ -58,9 +58,6 @@ Measured on the tested machine, idle desktop on battery at 11 % brightness: abou
   Metal plugin.
 - External displays (HDMI / USB-C): mirroring of the laptop screen only, not yet tested on hardware; no extended desktop.
 - A Metal app that is not on the allow-list gets no GPU device.
-- **Tahoe is slower and warmer than Sequoia** on the same laptop: the Liquid Glass interface needs much more GPU work
-  per frame, and a new install indexes for days. System Settings -> Accessibility ->
-  Display -> **Reduce transparency** removes most of the glass work.
 - Tahoe's desktop is scaled 1x (not HiDPI) on the tested panel.
 
 ## Architecture
