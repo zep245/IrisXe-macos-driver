@@ -25,7 +25,9 @@ kernel-port design, the Metal plugin and the shader translator come from NullMot
 | macOS | Sequoia 15.8.1 (daily), SMBIOS `MacBookPro16,2`, OpenCore. Tahoe 26.7.1 was tested on the same laptop until 2026-11-01; builds are still made for it |
 | Desktop | 1680x1050 (scaled), accelerated |
 
-Other Tiger Lake Iris Xe / UHD laptops may work; nothing else has been tested.
+Other Tiger Lake Iris Xe / UHD laptops may work. Reported working by testers (GitHub issue #1):
+**RedmiBook Pro 15 2021** (i5-11300H, 3200x2000 90 Hz panel) on Sequoia 15.8.1 and Tahoe 26.7.1. On its BIOS
+RMATG5B0P0F0F the first boot stopped at `71 vmap: cache level set` until `nmxgtawake=2` was added to the boot-args.
 
 Sequoia and Tahoe use the same display driver, display helper and Metal plugin. Only the accelerator differs:
 the artifact's `out/NMXAccel.kext` is for Sequoia, `out/tahoe/NMXAccel.kext` for Tahoe (IrisXe Manager picks the right one).
@@ -56,6 +58,10 @@ Measured on the tested machine, idle desktop on battery at 11 % brightness: abou
   processor (most YouTube videos come as AV1, which is on the GPU). `nvmtl-video-vp9` turns it on for testing.
 - Safari's web pages do not get hardware video decoding: Safari's GPU process (com.apple.WebKit.GPU) cannot load the
   Metal plugin.
+- One tester's machine froze about 1 s after the display was turned off and on again; `-nmxnopsr` (no panel self
+  refresh) avoided it there. Not seen on the tested machine.
+- No HiDPI (Retina) desktop sizes yet: the driver offers the panel's modes 1:1 only, so a 3200x2000 panel shows either a
+  very small desktop or a blurry upscale.
 - External displays (HDMI / USB-C): mirroring of the laptop screen only, not yet tested on hardware; no extended desktop.
 - A Metal app that is not on the allow-list gets no GPU device.
 - Tahoe's desktop is scaled 1x (not HiDPI) on the tested panel.
@@ -131,13 +137,16 @@ The artifact's `out/NVMTLDriver.bundle` is the **quiet** plugin (logs failures o
 is the verbose one, for diagnosing a problem.
 
 
-Requirements: OpenCore with SIP reduced and `SecureBootModel Disabled` (the kexts are unsigned), the Intel Tiger Lake
+Requirements: OpenCore with SIP reduced and `SecureBootModel Disabled` (the kexts are unsigned), **Lilu + AMFIPass**
+enabled in OpenCore (without them WindowServer refuses the Metal plugin: "mapping process is a platform binary, but mapped
+file is not"), the Intel Tiger Lake
 firmware (`i915/tgl_dmc_*`, `tgl_guc_*`, `tgl_huc_*`, see `app/Resources/nullmoth-gpu-firmware.txt`) in
 `/Library/NullMoth/firmware/i915/`.
 
 1. Copy `NMXGPU.kext` (and the accelerator kexts) to `/Library/Extensions`, approve them in System Settings ->
    Privacy & Security, and restart (macOS adds them to the auxiliary kext collection).
-2. Metal plugin: first time, the full bundle from the Mesa build into `/Library/GPUBundles/`; after that only the binary:
+2. Metal plugin: first time, the full bundle **and the Mesa driver folder next to it** (`nmx-metal/nvmtl/`, ANV) from
+   the Mesa build into `/Library/GPUBundles/` (IrisXe Manager's full-plugin part does both since b249); after that only the binary:
    `sudo tools/macos-helpers/nmx-plugin-update.sh <new NVMTLDriver.bundle>` - it keeps `air-runtime/`. Shader
    translator: `tools/macos-helpers/nmx-xlate-update.sh`.
 3. Acceleration at every boot: `sudo tools/macos-helpers/nmx-autoarm/install-autoarm.sh` (also installs the brightness
@@ -145,6 +154,7 @@ firmware (`i915/tgl_dmc_*`, `tgl_guc_*`, `tgl_huc_*`, see `app/Resources/nullmot
 4. Boot-args used on the tested machine:
    ```
    keepsyms=1 nmxintel=1 nmxaccel=1 -nmintelfboff nmxws=1 nmxcopyfwd=1 nmxautoarm=1 nmxmodern=1 nmxintelfb=1 -nmxnosnap
+   amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0
    ```
    (`nmxintel=1` opts the GPU in - without it the driver declines the device; `nmxws=1` + `nmxautoarm=1` turn on
    accelerated WindowServer at boot.)

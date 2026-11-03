@@ -74,6 +74,9 @@ cmd_status() {
         local air=missing; [ -f "$GB/NVMTLDriver.bundle/Contents/MacOS/air-runtime/libLLVM.dylib" ] && air=present
         say "plugin|$kind, $(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$P")|shader reader $air"
     else say "plugin|not installed|"; fi
+    # issue #3: a first install without the Mesa driver aborts WindowServer ("Failed to create MetalDevice")
+    if [ -f "$GB/nvmtl/libvulkan_intel.dylib" ]; then say "anv|installed $(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$GB/nvmtl/libvulkan_intel.dylib")|Mesa Intel Vulkan driver"
+    else say "anv|ANV missing|install the full plugin from the Mesa build"; fi
     if [ -f "$GB/nvmtl/libnvmtl_translate.dylib" ]; then say "xlate|$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$GB/nvmtl/libnvmtl_translate.dylib")|"
     else say "xlate|not installed|"; fi
     local V="$GB/NVMTLDriver.bundle/Contents/MacOS/libixdec.dylib"
