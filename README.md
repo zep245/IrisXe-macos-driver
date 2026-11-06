@@ -42,6 +42,7 @@ the artifact's `out/NMXAccel.kext` is for Sequoia, `out/tahoe/NMXAccel.kext` for
 | Metal apps | Through the Metal plugin, per app allow-list (`/Library/GPUBundles/nvmtl-allow.txt`); reports Metal 3 |
 | Browsers | Brave (Skia Graphite) and Safari: text, scrolling, video. Brave runs on the GPU with its GPU sandbox on |
 | Video decoding | H.264 and AV1 on the Iris Xe video engine for apps that use VideoToolbox (Brave/YouTube tested): 1080p, every picture identical to Apple's software decoder, ~72 % less processor time. VP9 stays on the processor (see Known issues) |
+| HiDPI (Retina) | Sharp "looks like" sizes 1280 x 800, 1440 x 900, 1600 x 1000 and 1680 x 1050 (HiDPI) on the 2560x1600 panel, chosen in System Settings -> Displays (see Installing, step "HiDPI") |
 | Camera apps | Photo Booth (incl. Effects), QuickTime, browser cameras |
 | Power | GPU idles in RC6 (0 MHz when idle), clock governor 300-1300 MHz, panel self refresh (PSR1) once accelerated |
 | Sleep / wake | Lid, Apple menu and display sleep; acceleration and PSR come back after wake |
@@ -60,8 +61,9 @@ Measured on the tested machine, idle desktop on battery at 11 % brightness: abou
   Metal plugin.
 - One tester's machine froze about 1 s after the display was turned off and on again; `-nmxnopsr` (no panel self
   refresh) avoided it there. Not seen on the tested machine.
-- No HiDPI (Retina) desktop sizes yet: the driver offers the panel's modes 1:1 only, so a 3200x2000 panel shows either a
-  very small desktop or a blurry upscale.
+- HiDPI: System Settings marks 3360 x 2100 (1x, very small text) as "Default", and its short list also shows the large
+  1x sizes. macOS picks these itself. Choose a HiDPI size once (Show all resolutions on); macOS keeps it.
+  `sudo nvram nmx-hidpi=0` and a restart go back to the old 1x size list.
 - External displays (HDMI / USB-C): mirroring of the laptop screen only, not yet tested on hardware; no extended desktop.
 - A Metal app that is not on the allow-list gets no GPU device.
 - Tahoe's desktop is scaled 1x (not HiDPI) on the tested panel.
@@ -161,6 +163,9 @@ firmware (`i915/tgl_dmc_*`, `tgl_guc_*`, `tgl_huc_*`, see `app/Resources/nullmot
 5. OpenCore: `DeviceProperties` for `PciRoot(0x0)/Pci(0x2,0x0)`: `AAPL,ig-platform-id` = `0000499A`, `device-id` =
    `499A0000`, `AAPL,slot-name` = `built-in`; WhateverGreen is not used. Kernel -> Block `com.apple.iokit.IONDRVSupport`
    (Exclude) so the driver's framebuffer is display 0.
+6. HiDPI: "1280 x 800 (HiDPI)" is on by default. For the larger sharp sizes run `sudo ./nmx-hidpi.sh big` (in the
+   artifact's `out/` folder) and restart, then System Settings -> Displays -> turn on "Show all resolutions" and pick
+   a size marked HiDPI (1440 x 900 is the MacBook Pro's default). `sudo ./nmx-hidpi.sh nobig` undoes it.
 
 ## Switches
 
@@ -204,7 +209,7 @@ Files in `/Library/GPUBundles/` (read at run time, no rebuild):
 | `nmx-autoarm/nmx-autoarm-report.sh` | The acceleration helper's last boot |
 | `nmx-speed.sh` | CPU time of WindowServer, logd, iconservicesagent and others over a minute, driver log lines, quiet / verbose plugin |
 | `nmx-icontest.sh` | Tahoe icon test: `on`, `collect`, `off` |
-| `nmx-hidpi.sh` | `on` / `off` / `status`: HiDPI (Retina) desktop sizes for the panel through a display override - sharper text and icons (test) |
+| `nmx-hidpi.sh` | `big`: the larger HiDPI sizes (1440 x 900, 1600 x 1000, 1680 x 1050); `nobig`: back to 1280 x 800 HiDPI only; `off`: no HiDPI; `status` |
 
 Driver log: `log show --last boot --predicate 'eventMessage contains "NullMoth"'`.
 

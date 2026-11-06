@@ -114,6 +114,9 @@ jobs:
           $M -I"$RUNNER_TEMP/vkh/include" tools/vk/vkvideoprobe.c -o "$T/vkvideoprobe" || echo "vkvideoprobe did not build"
           for f in "$T"/*; do codesign -f -s - "$f"; done
           cp tools/macos-helpers/nmx-app-gpu.sh tools/vk/run-vkvideo.sh "$T/"
+          cp tools/macos-helpers/nmx-hidpi.sh "$RUNNER_TEMP/nmx/out/" && chmod +x "$RUNNER_TEMP/nmx/out/nmx-hidpi.sh"   # b261
+          xcrun clang -arch x86_64 -O1 -mmacosx-version-min=14.0 tools/display/cgmodes.c -framework ApplicationServices \
+            -o "$RUNNER_TEMP/nmx/out/cgmodes" && codesign -f -s - "$RUNNER_TEMP/nmx/out/cgmodes" || echo "cgmodes did not build"   # b263
           echo "### Metal test tools built: $(ls "$T" | tr '\n' ' ')" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload logs and kext

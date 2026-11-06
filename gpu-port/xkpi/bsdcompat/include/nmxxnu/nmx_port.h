@@ -23,13 +23,16 @@ struct nmx_fb_info {
     uint64_t kva;                       /* its kernel mapping */
     uint32_t pclk_khz;                  /* timing of the largest output's mode */
     uint32_t htotal, vtotal, hsync_start, hsync_end, vsync_start, vsync_end;
+    uint32_t buf_w, buf_h;              /* b265: the scan-out buffers' size (larger than width x height for HiDPI
+                                           desktops bigger than the panel, shrunk by a plane scaler) */
 };
 /* before the driver attaches: settings the bridge needs from the driver (scan-out buffers in contiguous VRAM) */
 void nmx_fb_before_attach(void);
 int nmx_fb_open(void *dev, struct nmx_fb_info *out);
 void nmx_fb_close(void *dev);
 int nmx_fb_power(void *dev, int on);
-/* desktop size w x h (<= native) shown full-screen by the panel fitter; 0 x 0 = native */
+/* desktop size w x h shown full-screen: smaller than the panel by the panel fitter, larger (up to buf_w x buf_h, b265)
+   by a plane scaler; 0 x 0 = native */
 int nmx_fb_set_size(void *dev, uint32_t w, uint32_t h);
 /* b89: aperture-backed buffers for the accelerator ("VRAM"); 0 = ok, phys/kva of one contiguous run */
 int nmx_fb_vram_alloc(void *dev, uint64_t size, uint64_t *phys, void **kva, void **handle);
@@ -50,7 +53,10 @@ int nmx_fb_back_content(void *dev);  /* b169: lit pixels of 64 in the newest hel
 extern int nmx_fb_defer_wanted;
 extern int nmx_fb_ext_wanted;          /* b180: external outputs mirror the panel; -nmxnoext = 0 */
 extern int nmx_fb_psr_wanted;          /* b170: PSR once frames flip; -nmxnopsr = 0 */
+extern int nmx_fb_big_wanted;          /* b265: scan-out buffers up to 21/16 of the panel (HiDPI step 2) */
 int nmx_fb_flip_commit(void *dev);
+/* b267: the built-in panel's EDID as i915 read it (bytes copied, 0 = none) */
+int nmx_fb_edid(void *dev, uint8_t *buf, uint32_t max);
 int nmx_fb_flip_home(void *dev);
 #ifdef __cplusplus
 }

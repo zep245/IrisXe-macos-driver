@@ -4,6 +4,8 @@
 #   sudo ./nmx-hidpi.sh status   shows the panel's display IDs, the mode now in use and whether the override is there
 #   sudo ./nmx-hidpi.sh on       adds HiDPI sizes for the panel; restart, then System Settings -> Displays
 #   sudo ./nmx-hidpi.sh off      removes them again; restart
+#   sudo ./nmx-hidpi.sh on-noiog b273: as 'on' without IOGFlags (only if 'on' lost sizes)
+#   sudo ./nmx-hidpi.sh big      b265: also the larger sharp sizes (HiDPI step 2, test); nobig turns that off
 #
 # Why: the driver's smaller desktop sizes (1920, 1680, 1600, 1440, 1280 wide) are real 1x modes - macOS draws the
 # desktop that small and the display engine stretches it to the 2560x1600 panel, so every pixel becomes ~1.5 pixels and
@@ -38,18 +40,30 @@ entry() {
     printf '\x00\x20\x00\x00'
 }
 b64() { entry "$@" | base64 | tr -d '\n'; }
+# b273: entries as in Apple's file for its 13" 2560x1600 MacBook Pro panel (DisplayVendorID-610/DisplayProductID-a048):
+# a HiDPI size is its pixel size only (8 bytes, 2x the "looks like" size); a 1x size has flags 1 (12 bytes)
+be32() { printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' $(($1>>24&255)) $(($1>>16&255)) $(($1>>8&255)) $(($1&255)))"; }
+hidpi64() { { be32 "$1"; be32 "$2"; } | base64 | tr -d '\n'; }
+onex64() { { be32 "$1"; be32 "$2"; be32 1; } | base64 | tr -d '\n'; }
 
 case "${1:-status}" in
 status)
     ids
     echo "panel IDs: vendor $VID (0x$VHEX), product $PID (0x$PHEX)"
     echo "override:  $([ -f "$FILE" ] && echo "ON  ($FILE)" || echo "off")"
+    echo "step 2:    $(nvram nmx-hidpi2 2>/dev/null | cut -f2- | grep -q 1 && echo "on (nmx-hidpi2=1)" || echo off)"
+    echo "driver:    nmxhidpi $(ioreg -lw0 -r -c NMXGPUFB 2>/dev/null | awk -F'= ' '/"NMXHiDPI"/{print ($2=="Yes")?"on":"off"; exit}'), panel $(ioreg -lw0 -r -c NMXGPUFB 2>/dev/null | awk -F'= ' '/"NMXPanelWidth"/{w=$2} /"NMXPanelHeight"/{h=$2} END{print w"x"h}')"
     echo "--- what macOS shows now"
     system_profiler SPDisplaysDataType 2>/dev/null | grep -E 'Resolution|UI Looks like|Retina|Main Display|Display Type' | sed 's/^ */  /'
     ;;
-on)
+on|on-noiog)
     ids
     mkdir -p "$DIR"
+    reg=$(ioreg -lw0 -r -c NMXGPUFB 2>/dev/null)
+    NW=$(awk -F'= ' '/"NMXPanelWidth"/{print $2; exit}' <<<"$reg");  NH=$(awk -F'= ' '/"NMXPanelHeight"/{print $2; exit}' <<<"$reg")
+    BW=$(awk -F'= ' '/"NMXBufferWidth"/{print $2; exit}' <<<"$reg"); BH=$(awk -F'= ' '/"NMXBufferHeight"/{print $2; exit}' <<<"$reg")
+    [ -n "$NW" ] && [ -n "$NH" ] || { NW=2560; NH=1600; }
+    [ -n "$BW" ] && [ -n "$BH" ] || { BW=$NW; BH=$NH; }
     {
     echo '<?xml version="1.0" encoding="UTF-8"?>'
     echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
@@ -57,30 +71,56 @@ on)
     echo "  <key>DisplayProductName</key><string>Built-in Retina Display</string>"
     echo "  <key>DisplayVendorID</key><integer>$VID</integer>"
     echo "  <key>DisplayProductID</key><integer>$PID</integer>"
+    # b273: Apple's own entries for its 13" MacBook Pro panel. IOGFlags 4: only these sizes and the driver's, none
+    # made up by macOS. target-default-ppmm: the default size is the one with about 10.07 pixels per mm of panel
+    # (looks like 1440x900 on a 30 cm wide 2560x1600 panel, as on the MacBook Pro)
+    [ "$1" = on ] && echo "  <key>IOGFlags</key><integer>4</integer>"
+    echo "  <key>target-default-ppmm</key><real>10.0699301</real>"
     echo '  <key>scale-resolutions</key><array>'
-    # "looks like" sizes, all 16:10 like the panel: pixel size = 2x
-    for wh in 1280x800 1440x900 1600x1000 1680x1050; do
+    # HiDPI: largest first, pixel size up to the driver's scan-out buffer (b265 step 2), the panel's own half size,
+    # then smaller ones; same shape as the panel only
+    seen=""
+    for wh in 1920x1200 1680x1050 1600x1000 1440x900 "$((NW/2))x$((NH/2))" 1280x800 1152x720 1024x640; do
         w=${wh%x*}; h=${wh#*x}
-        echo "    <data>$(b64 $((w*2)) $((h*2)) 1)</data>"
+        [ $((w * NH)) -eq $((h * NW)) ] && [ $((w*2)) -le "$BW" ] && [ $((h*2)) -le "$BH" ] || continue
+        case " $seen " in *" $wh "*) continue ;; esac; seen="$seen $wh"
+        echo "    <data>$(hidpi64 $((w*2)) $((h*2)))</data>"
+    done
+    # one plain (1x) size, as on the MacBook Pro
+    for wh in 1920x1200 1680x1050; do
+        w=${wh%x*}; h=${wh#*x}
+        [ "$w" -lt "$NW" ] && [ $((w * NH)) -eq $((h * NW)) ] || continue
+        echo "    <data>$(onex64 "$w" "$h")</data>"; break
     done
     echo '  </array>'
     echo '</dict></plist>'
     } > "$FILE"
     chmod 644 "$FILE"; chown root:wheel "$FILE"
     if ! plutil -lint "$FILE" >/dev/null; then echo "ERROR: the file did not come out right - removed"; rm -f "$FILE"; exit 1; fi
+    nvram -d nmx-hidpi 2>/dev/null; echo "driver: HiDPI on (the default since b264)"
     echo "HiDPI sizes added: $FILE"
+    plutil -p "$FILE"
     echo
     echo "Now:"
     echo "  1. Restart the Mac."
-    echo "  2. System Settings -> Displays: pick a size. The sharpest is the one that looks like 1280 x 800"
-    echo "     (exactly the panel's pixels). 1440 x 900 gives more space and is still sharp."
-    echo "     (If Displays shows only a list, turn on 'Show all resolutions' and pick one marked HiDPI.)"
+    echo "  2. System Settings -> Displays: pick a size (HiDPI ones are sharp)."
     echo "  3. If nothing changed, send me: sudo $0 status"
+    ;;
+big)
+    # b265: HiDPI step 2 - larger sharp sizes (looks like 1440x900 / 1680x1050 on 2560x1600): the display driver keeps
+    # scan-out buffers larger than the panel and shrinks the desktop with the display engine's plane scaler
+    nvram nmx-hidpi2=1 && echo "HiDPI step 2 ON (nvram nmx-hidpi2=1)"
+    echo "Now: 1. restart  2. System Settings -> Displays -> turn on 'Show all resolutions' -> pick a size marked HiDPI"
+    echo "     (b272: the driver offers 1440x900, 1600x1000 and 1680x1050 HiDPI itself)"
+    ;;
+nobig)
+    nvram -d nmx-hidpi2 2>/dev/null; echo "HiDPI step 2 off - restart"
     ;;
 off)
     ids
     rm -f "$FILE"; rmdir "$DIR" 2>/dev/null
-    echo "HiDPI override removed - restart the Mac"
+    nvram nmx-hidpi=0   # b264: HiDPI is on by default in the driver - 0 turns it off (the driver's own 1x sizes)
+    echo "HiDPI override removed and the driver switched to its own 1x sizes (nvram nmx-hidpi=0) - restart the Mac"
     ;;
-*) echo "usage: sudo $0 status|on|off"; exit 1 ;;
+*) echo "usage: sudo $0 status|on|on-noiog|off|big|nobig"; exit 1 ;;
 esac

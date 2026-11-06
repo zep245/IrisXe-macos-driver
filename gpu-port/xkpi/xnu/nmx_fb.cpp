@@ -9,6 +9,11 @@
  */
 #include <IOKit/IOLib.h>
 #include <IOKit/graphics/IOFramebuffer.h>
+enum { kNMXDisplayModeValidForHiResFlag = 0x00800000 };   /* IOGraphicsTypes kDisplayModeValidForHiResFlag */
+enum { kNMXDisplayModeNotPresetFlag = 0x00000200 };       /* IOGraphicsTypes kDisplayModeNotPresetFlag */
+#ifndef detailedTimingModeID
+#define detailedTimingModeID __reservedA[0]
+#endif
 #include <IOKit/IOMessage.h>   /* b230: kIOMessageServicePropertyChange */
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -565,12 +570,22 @@ public:
     /* 10-18 (Retina sizes): desktop sizes macOS can pick in Displays. WindowServer cannot scale HiDPI modes without a
        GPU of its own, so smaller sizes are real modes: macOS draws at that size and the display engine's panel fitter
        scales it to the panel (larger UI, fewer pixels for the software desktop to draw). Mode 1 is the panel's own. */
-    enum { kMaxModes = 8 };
+    enum { kMaxModes = 12 };
     uint32_t fModeW[kMaxModes], fModeH[kMaxModes]; uint32_t fModeCount = 1; IODisplayModeID fCurMode = 1;
     void buildModes() {
         static const uint32_t widths[] = { 1920, 1680, 1600, 1440, 1280 };
         fModeW[0] = fInfo.width; fModeH[0] = fInfo.height; fModeCount = 1;
+        /* b264: ON by default (11-03: "1280 x 800 (HiDPI)" sharp on the tested panel; the NVRAM switch had been lost
+           between restarts). Off: nvram nmx-hidpi=0 or boot-arg nmxhidpi=0 - the driver's own 1x sizes come back. */
+        { int v = 1; const bool arg = PE_parse_boot_argn("nmxhidpi", &v, sizeof v);
+          const char nv = nvramChar("nmx-hidpi");
+          fHiDPI = arg ? v != 0 : nv != '0'; }
         if (PE_parse_boot_argn("-nmxfbonemode", nullptr, 0)) return;
+        /* b272: with HiDPI (step 2) the driver offers its own sizes again, as on Apple's MacBook panel a048 (13" 2560x1600:
+           3360x2100, 2880x1800, 2560x1600 at 2x, 1920x1200 at 1x). System Settings lists the framebuffer's own modes and
+           hides the ones macOS builds from a scaler (11-04: HiDPI off -> 6 sizes listed; on -> only the panel's mode).
+           nvram nmx-hidpi-own=0: back to b271 (macOS's sizes only) */
+        if (fHiDPI && (!bigBuffers() || nvramChar("nmx-hidpi-own") == '0')) return;
         for (unsigned i = 0; i < sizeof(widths) / sizeof(widths[0]) && fModeCount < kMaxModes; i++) {
             uint32_t w = widths[i];
             if (w >= fInfo.width || ((uint64_t)fInfo.height * w) % fInfo.width) continue;   /* same shape only */
@@ -578,8 +593,207 @@ public:
             if (h & 1) continue;
             fModeW[fModeCount] = w; fModeH[fModeCount] = h; fModeCount++;
         }
+        if (!fHiDPI) return;
+        static const uint32_t looks[] = { 1440, 1600, 1680, 1920 };   /* HiDPI "looks like" widths: drawn at 2x, shrunk */
+        for (unsigned i = 0; i < sizeof(looks) / sizeof(looks[0]) && fModeCount < kMaxModes; i++) {
+            const uint32_t w = looks[i] * 2;
+            if (w <= fInfo.width || w > bufW() || ((uint64_t)fInfo.height * w) % fInfo.width) continue;
+            const uint32_t h = (uint32_t)((uint64_t)fInfo.height * w / fInfo.width);
+            if ((h & 1) || h > bufH()) continue;
+            fModeW[fModeCount] = w; fModeH[fModeCount] = h; fModeCount++;
+        }
+        FBLOG("hidpi: %u own sizes (largest %ux%u, buffer %ux%u)", fModeCount, fModeW[fModeCount - 1], fModeH[fModeCount - 1], bufW(), bufH());
     }
-    bool modeOK(IODisplayModeID m) const { return m >= 1 && (uint32_t)m <= fModeCount; }
+    /* b272: one of our own sizes larger than the panel (drawn at 2x and shrunk by the plane scaler) */
+    bool ownBig(IODisplayModeID m) const {
+        return m >= 1 && (uint32_t)m <= fModeCount && (fModeW[m - 1] > fInfo.width || fModeH[m - 1] > fInfo.height);
+    }
+    /* b261 (HiDPI, boot-arg nmxhidpi=1): macOS builds its own desktop sizes - 1x scaled and 2x HiDPI ("Retina") - on top
+       of the panel's raster when the framebuffer says it can scale (IOFBScalerInfo) and accepts programmed timings
+       (validateDetailedTiming / setDetailedTimings), as on Apple's Intel framebuffers and NVRMFB. Then only the native
+       mode is ours; every other size is one of macOS's timings: the panel's raster with a desktop ("scaled") size.
+       First step: desktops up to the panel's size only (the scan-out buffer is the panel's size) - HiDPI 1280x800 on
+       2560x1600 and 1600x1000 on 3200x2000 are exactly the panel's pixels; smaller ones are enlarged by the panel fitter
+       as before. Larger desktops (HiDPI 1440x900 on 2560x1600) need a larger buffer and downscaling - not yet. */
+    bool fHiDPI = false;
+    /* b265: the scan-out buffers' size - larger than the panel with HiDPI step 2 (nmx-hidpi2=1) */
+    uint32_t bufW() const { return fInfo.buf_w ? fInfo.buf_w : fInfo.width; }
+    uint32_t bufH() const { return fInfo.buf_h ? fInfo.buf_h : fInfo.height; }
+    bool bigBuffers() const { return bufW() > fInfo.width || bufH() > fInfo.height; }
+    /* b267: the panel's real EDID for macOS (with HiDPI step 2). Without one the display is "unkn" with no timing range,
+       so macOS marks every size it builds itself as not safe (11-03: flags 0x00a00009 - no kDisplayModeSafeFlag) and
+       hides them from System Settings, although they work (cgmodes set 11 / 13: looks-like 1440x900 / 1680x1050) */
+    uint8_t fEdid[512]; uint32_t fEdidSize = 0;
+    bool hasDDCConnect(IOIndex) override {
+        static int said; if (said++ < 4) FBLOG("hidpi: hasDDCConnect asked -> %s", fEdidSize >= 128 ? "yes" : "no");
+        return fEdidSize >= 128;
+    }
+    IOReturn getDDCBlock(IOIndex, UInt32 blockNumber, IOSelect blockType, IOOptionBits, UInt8 *data, IOByteCount *length) override {
+        { static int said; if (said++ < 6) FBLOG("hidpi: getDDCBlock %u (type 0x%x) - EDID %u bytes", (unsigned)blockNumber, (unsigned)blockType, fEdidSize); }
+        if (blockType != kIODDCBlockTypeEDID || blockNumber == 0 || blockNumber * 128 > fEdidSize || !data || !length) return kIOReturnUnsupported;
+        if (*length < 128) return kIOReturnBadArgument;
+        bcopy(fEdid + (blockNumber - 1) * 128, data, 128); *length = 128;
+        return kIOReturnSuccess;
+    }
+    /* b270: IOGraphics never read the EDID through the framebuffer (b268/b269: hasDDCConnect, HLDDCSense and
+       getDDCBlock were not called - only LLDDCSense was asked), so the display stays "unkn" and macOS keeps its own
+       sizes "not safe". The EDID and the identity it carries go straight onto the display services instead
+       (IODisplayEDID, DisplayVendorID/ProductID/SerialNumber, as IODisplay sets them from a real EDID), on the
+       display connection and on the IODisplay (AppleBacklightDisplay) under it once that has matched. */
+    thread_call_t fEdidCall = nullptr; unsigned fEdidTries = 0; bool fEdidPut = false;
+    static void edidFire(thread_call_param_t a, thread_call_param_t) { ((NMXGPUFB *)a)->putEdid(); }
+    void putEdid() {
+        if (fEdidSize < 128 || fEdidPut) return;
+        OSData *ed = OSData::withBytes(fEdid, fEdidSize);
+        if (!ed) return;
+        const uint32_t vid = (uint32_t)(fEdid[8] << 8 | fEdid[9]), pid = (uint32_t)(fEdid[10] | fEdid[11] << 8);
+        const uint32_t ser = (uint32_t)(fEdid[12] | fEdid[13] << 8 | fEdid[14] << 16 | (uint32_t)fEdid[15] << 24);
+        unsigned connects = 0, displays = 0;
+        if (OSIterator *it = getChildIterator(gIOServicePlane)) {
+            while (IORegistryEntry *c = OSDynamicCast(IORegistryEntry, it->getNextObject())) {
+                if (!c->metaCast("IODisplayConnect")) continue;
+                connects++;
+                c->setProperty("IODisplayEDID", ed);
+                if (OSIterator *dit = c->getChildIterator(gIOServicePlane)) {
+                    while (IORegistryEntry *d = OSDynamicCast(IORegistryEntry, dit->getNextObject())) {
+                        if (!d->metaCast("IODisplay")) continue;
+                        displays++;
+                        d->setProperty("IODisplayEDID", ed);
+                        d->setProperty("IODisplayEDIDOriginal", ed);
+                        d->setProperty("DisplayVendorID", (unsigned long long)vid, 32);
+                        d->setProperty("DisplayProductID", (unsigned long long)pid, 32);
+                        d->setProperty("DisplaySerialNumber", (unsigned long long)ser, 32);
+                    }
+                    dit->release();
+                }
+            }
+            it->release();
+        }
+        ed->release();
+        if (displays) {
+            fEdidPut = true;
+            FBLOG("hidpi: EDID put on %u display(s) (vendor 0x%04x product 0x%04x) after %u tries", displays, vid, pid, fEdidTries);
+        } else if (fEdidTries++ < 40 && fEdidCall) {
+            uint64_t dl; clock_interval_to_deadline(500, kMillisecondScale, &dl);
+            thread_call_enter_delayed(fEdidCall, dl);
+        } else FBLOG("hidpi: no IODisplay under the framebuffer after %u tries (%u connection(s)) - EDID not put", fEdidTries, connects);
+    }
+    void loadEdid() {
+        if (!bigBuffers() || PE_parse_boot_argn("-nmxnoedid", nullptr, 0)) return;
+        const int n = nmx_fb_edid(fDev, fEdid, sizeof fEdid);
+        if (n < 128 || fEdid[0] != 0x00 || fEdid[1] != 0xff || fEdid[7] != 0x00) { FBLOG("hidpi: no EDID from the panel (%d bytes)", n); return; }
+        fEdidSize = (uint32_t)n;
+        const uint16_t mfg = (uint16_t)(fEdid[8] << 8 | fEdid[9]), prod = (uint16_t)(fEdid[10] | fEdid[11] << 8);
+        const char m[4] = { (char)('@' + ((mfg >> 10) & 31)), (char)('@' + ((mfg >> 5) & 31)), (char)('@' + (mfg & 31)), 0 };
+        FBLOG("hidpi: panel EDID %u bytes for macOS - maker %s product 0x%04x, %u x %u cm (-nmxnoedid: none)", fEdidSize, m, prod,
+              (unsigned)fEdid[21], (unsigned)fEdid[22]);
+    }
+    enum { kMaxDT = 64 };
+    IODetailedTimingInformationV2 fDT[kMaxDT]; unsigned fNDT = 0; unsigned fValidateCalls = 0;
+    int dtIndex(IODisplayModeID id) const {
+        for (unsigned i = 0; i < fNDT; i++) if ((IODisplayModeID)fDT[i].detailedTimingModeID == id) return (int)i;
+        return -1;
+    }
+    /* the desktop size of any mode: ours (1..fModeCount) or one of macOS's timings */
+    bool modeSize(IODisplayModeID m, uint32_t *w, uint32_t *h) const {
+        if (m >= 1 && (uint32_t)m <= fModeCount) { *w = fModeW[m - 1]; *h = fModeH[m - 1]; return true; }
+        const int i = dtIndex(m); if (i < 0) return false;
+        const IODetailedTimingInformationV2 &d = fDT[i];
+        const bool sc = d.horizontalScaled && d.verticalScaled;
+        *w = sc ? d.horizontalScaled : d.horizontalActive; *h = sc ? d.verticalScaled : d.verticalActive;
+        return true;
+    }
+    bool modeOK(IODisplayModeID m) const { uint32_t w, h; return modeSize(m, &w, &h); }
+    void publishScaler() {
+        IODisplayScalerInformation si; bzero(&si, sizeof si);
+        /* desktops up to the panel size, enlarged by the panel fitter; b265: with larger scan-out buffers also larger
+           desktops, shrunk by the plane scaler (HiDPI "looks like 1440x900" / "1680x1050" on 2560x1600) */
+        si.scalerFeatures = kIOScaleCanUpSamplePixels | (bigBuffers() ? kIOScaleCanDownSamplePixels : 0);
+        si.maxHorizontalPixels = bufW(); si.maxVerticalPixels = bufH();
+        OSData *d = OSData::withBytes(&si, sizeof si);
+        if (d) { setProperty(kIOFBScalerInfoKey, d); d->release(); }
+        /* the range macOS may program timings in: only the panel's own (validateDetailedTiming puts its clock back anyway) */
+        IODisplayTimingRangeV1 r; bzero(&r, sizeof r);
+        const UInt64 pclk = (UInt64)fInfo.pclk_khz * 1000;
+        r.minPixelClock = pclk ? pclk - pclk / 50 : 25000000ull; r.maxPixelClock = pclk ? pclk + pclk / 50 : 1200000000ull;
+        r.supportedSyncFlags = kIORangeSupportsSeparateSyncs; r.supportedSignalConfigs = kIODigitalSignal;
+        r.minFrameRate = 23; r.maxFrameRate = 240; r.minLineRate = 10000; r.maxLineRate = 1000000;
+        r.maxHorizontalTotal = 16384; r.maxVerticalTotal = 16384;
+        r.charSizeHorizontalActive = r.charSizeHorizontalBlanking = r.charSizeHorizontalSyncOffset = r.charSizeHorizontalSyncPulse = 1;
+        r.charSizeVerticalActive = r.charSizeVerticalBlanking = r.charSizeVerticalSyncOffset = r.charSizeVerticalSyncPulse = 1;
+        r.charSizeHorizontalBorderLeft = r.charSizeHorizontalBorderRight = r.charSizeVerticalBorderTop = r.charSizeVerticalBorderBottom = 1;
+        r.charSizeHorizontalTotal = r.charSizeVerticalTotal = 1;
+        r.minHorizontalActiveClocks = 640; r.maxHorizontalActiveClocks = 8192; r.maxHorizontalBlankingClocks = 8192;
+        r.maxHorizontalSyncOffsetClocks = 8192; r.minHorizontalPulseWidthClocks = 1; r.maxHorizontalPulseWidthClocks = 8192;
+        r.minVerticalActiveClocks = 400; r.maxVerticalActiveClocks = 8192; r.maxVerticalBlankingClocks = 8192;
+        r.maxVerticalSyncOffsetClocks = 8192; r.minVerticalPulseWidthClocks = 1; r.maxVerticalPulseWidthClocks = 8192;
+        r.maxNumLinks = 1; r.minLink0PixelClock = 25000; r.maxLink0PixelClock = 1200000;
+        r.supportedPixelEncoding = kIORangePixelEncodingRGB444; r.supportedBitsPerColorComponent = kIORangeBitsPerColorComponent8;
+        r.supportedColorimetryModes = kIORangeColorimetryNativeRGB | kIORangeColorimetrysRGB; r.supportedDynamicRangeModes = kIORangeDynamicRangeSDR;
+        OSData *g = OSData::withBytes(&r, sizeof r);
+        if (g) { setProperty(kIOFBTimingRangeKey, g); g->release(); }
+        FBLOG("hidpi: IOFBScalerInfo published (%s, max %ux%u) - macOS builds the desktop sizes (on by default; off: nvram nmx-hidpi=0)",
+              bigBuffers() ? "up- and down-sampling" : "up-sampling", bufW(), bufH());
+    }
+    IOReturn validateDetailedTiming(void *description, IOByteCount descripSize) override {
+        if (!fHiDPI) return kIOReturnUnsupported;
+        if (!description) return kIOReturnBadArgument;
+        IODetailedTimingInformationV2 *d = nullptr;
+        if (descripSize == sizeof(IOFBDisplayModeDescription)) d = &((IOFBDisplayModeDescription *)description)->timingInfo.detailedInfo.v2;
+        else if (descripSize == sizeof(IODetailedTimingInformationV2)) d = (IODetailedTimingInformationV2 *)description;
+        if (!d) return kIOReturnBadArgument;
+        fValidateCalls++;
+        const char *why = nullptr;
+        if (d->horizontalActive != fInfo.width || d->verticalActive != fInfo.height) why = "not the panel's raster";
+        else if (d->horizontalScaledInset || d->verticalScaledInset) why = "inset";
+        else if (d->scalerFlags & ~(UInt32)kIOScaleStretchToFit) why = "rotation/axis flags";
+        else if (d->horizontalBorderLeft | d->horizontalBorderRight | d->verticalBorderTop | d->verticalBorderBottom) why = "borders";
+        else if (d->horizontalScaled || d->verticalScaled) {
+            const UInt32 sw = d->horizontalScaled, sh = d->verticalScaled;
+            if (!sw || !sh) why = "one scaled axis";
+            else if (sw > bufW() || sh > bufH()) why = bigBuffers() ? "desktop larger than the scan-out buffers" : "desktop larger than the panel (HiDPI step 2 off)";
+            else if (sw < 640 || sh < 400) why = "desktop below 640x400";
+            /* b262: the panel fitter stretches to the full panel, so a desktop of another shape would be distorted
+               (11-03: macOS offered 1280x720 / 1920x1080 / 2560x1440 on the 16:10 panel) - same shape only, 1 % */
+            else if ((UInt64)sw * fInfo.height * 100 < (UInt64)sh * fInfo.width * 99 ||
+                     (UInt64)sw * fInfo.height * 100 > (UInt64)sh * fInfo.width * 101) why = "another shape than the panel";
+        }
+        if (fValidateCalls <= 64 || !why)
+            FBLOG("hidpi: validateDetailedTiming #%u id 0x%x raster %ux%u desktop %ux%u pclk %llu -> %s", fValidateCalls,
+                  (unsigned)d->detailedTimingModeID, d->horizontalActive, d->verticalActive, d->horizontalScaled, d->verticalScaled,
+                  (unsigned long long)d->pixelClock, why ? why : "OK");
+        if (why) return kIOReturnUnsupportedMode;
+        /* the panel's own timing, whatever macOS computed from it */
+        d->pixelClock = d->minPixelClock = d->maxPixelClock = (UInt64)fInfo.pclk_khz * 1000;
+        if (fInfo.htotal > fInfo.width) d->horizontalBlanking = fInfo.htotal - fInfo.width;
+        if (fInfo.vtotal > fInfo.height) d->verticalBlanking = fInfo.vtotal - fInfo.height;
+        if (descripSize == sizeof(IOFBDisplayModeDescription)) {
+            IODisplayModeInformation *info = &((IOFBDisplayModeDescription *)description)->info;
+            const bool sc = d->horizontalScaled && d->verticalScaled;
+            info->maxDepthIndex = 0;
+            info->nominalWidth = sc ? d->horizontalScaled : d->horizontalActive;
+            info->nominalHeight = sc ? d->verticalScaled : d->verticalActive;
+            info->refreshRate = fRefresh16;
+        }
+        return kIOReturnSuccess;
+    }
+    IOReturn setDetailedTimings(OSArray *array) override {
+        if (!fHiDPI) return kIOReturnUnsupported;
+        if (!array) { fNDT = 0; removeProperty(kIOFBDetailedTimingsKey); FBLOG("hidpi: setDetailedTimings(NULL)"); return kIOReturnSuccess; }
+        unsigned n = 0, bad = 0;
+        for (unsigned i = 0; i < array->getCount() && n < kMaxDT; i++) {
+            OSData *data = OSDynamicCast(OSData, array->getObject(i));
+            if (!data || data->getLength() < sizeof(IODetailedTimingInformationV2)) { bad++; continue; }
+            bcopy(data->getBytesNoCopy(), &fDT[n++], sizeof(IODetailedTimingInformationV2));
+        }
+        fNDT = n;
+        setProperty(kIOFBDetailedTimingsKey, array);
+        FBLOG("hidpi: setDetailedTimings: %u timing(s) (%u malformed, %u offered), current mode 0x%x", n, bad, array->getCount(), (unsigned)fCurMode);
+        for (unsigned i = 0; i < n && i < 32; i++)
+            FBLOG("hidpi:   dt 0x%x raster %ux%u desktop %ux%u", fDT[i].detailedTimingModeID, fDT[i].horizontalActive, fDT[i].verticalActive,
+                  fDT[i].horizontalScaled, fDT[i].verticalScaled);
+        return kIOReturnSuccess;
+    }
 
     bool initWith(void *dev, const nmx_fb_info &info) {
         if (!init()) return false;
@@ -599,9 +813,20 @@ public:
     bool start(IOService *provider) override {
         publishBacklight(provider);   /* before IOFramebuffer::start: open() looks for "backlight" */
         publishGPUName(provider);
+        setProperty("NMXPanelWidth", (unsigned long long)fInfo.width, 32);    /* b261: for nmx-hidpi.sh */
+        setProperty("NMXPanelHeight", (unsigned long long)fInfo.height, 32);
+        setProperty("NMXHiDPI", fHiDPI ? kOSBooleanTrue : kOSBooleanFalse);
+        setProperty("NMXBufferWidth", (unsigned long long)bufW(), 32);     /* b273: for nmx-hidpi.sh (largest HiDPI size) */
+        setProperty("NMXBufferHeight", (unsigned long long)bufH(), 32);
+        if (fHiDPI) publishScaler();
+        if (fHiDPI) loadEdid();
         nmx_step("fb: IOFramebuffer::start");
         if (!IOFramebuffer::start(provider)) { nmx_step("fb: IOFramebuffer::start FAILED"); return false; }
         nmx_step("fb: IOFramebuffer::start returned");
+        if (fEdidSize >= 128 && (fEdidCall = thread_call_allocate(edidFire, this)) != nullptr) {   /* b270 */
+            uint64_t dl; clock_interval_to_deadline(300, kMillisecondScale, &dl);
+            thread_call_enter_delayed(fEdidCall, dl);
+        }
         /* b85b (10-19): set AFTER IOFramebuffer::start, as NMIntelFB did when it joined the NVIDIA group (b85 set it
            before start and NMXGPU did not come up). Head 0 of the NMXAccel display group, as NVRMFB heads are. Without IOFBDependentIndex the AGDC
            slot table left this framebuffer out ("fbmap n=0 (left out: noidx 1)") and CoreDisplay logged "Unable to find
@@ -674,6 +899,7 @@ public:
             fVblTimer = nullptr;
         }
         cursorTeardown();
+        if (fEdidCall) { while (!thread_call_free(fEdidCall)) { thread_call_cancel(fEdidCall); IOSleep(5); } fEdidCall = nullptr; }
         if (fBacklight) { fBacklight->detachRegs(); fBacklight->detach(this); OSSafeReleaseNULL(fBacklight); }
         OSSafeReleaseNULL(fMMIO);
         { IOMemoryMap *m = fScanMap; fScanMap = nullptr; if (m) m->release(); }
@@ -712,7 +938,7 @@ public:
     bool isConsoleDevice() override { return true; }
     IODeviceMemory *getApertureRange(IOPixelAperture aperture) override {
         if (aperture != kIOFBSystemAperture) return nullptr;
-        return IODeviceMemory::withRange(fInfo.phys, (IOPhysicalLength)fInfo.pitch * fInfo.height);   /* every mode: same buffer, same pitch */
+        return IODeviceMemory::withRange(fInfo.phys, (IOPhysicalLength)fInfo.pitch * bufH());   /* every mode: same buffer, same pitch */
     }
     IODeviceMemory *getVRAMRange() override { return IODeviceMemory::withRange(fInfo.phys, fInfo.size); }
 
@@ -786,26 +1012,27 @@ public:
             NmxScanoutReq *r = (NmxScanoutReq *)p1;
             if (!r || r->version != 2u) return kIOReturnBadArgument;
             if (!fScanMap) {
-                IODeviceMemory *m = IODeviceMemory::withRange(fInfo.phys, (IOPhysicalLength)fInfo.pitch * fInfo.height);
+                IODeviceMemory *m = IODeviceMemory::withRange(fInfo.phys, (IOPhysicalLength)fInfo.pitch * bufH());
                 IOMemoryMap *mm = m ? m->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache) : nullptr;
                 if (m) m->release();
                 if (!mm) { FBLOG("scanout: the framebuffer would not map for the accelerator's copy"); return kIOReturnNoMemory; }
                 if (!OSCompareAndSwapPtr(nullptr, mm, (void *volatile *)&fScanMap)) mm->release();
                 else FBLOG("scanout: framebuffer mapped for the accelerator (%ux%u pitch %u, %llu bytes)", fInfo.width, fInfo.height,
-                           fInfo.pitch, (unsigned long long)fInfo.pitch * fInfo.height);
+                           fInfo.pitch, (unsigned long long)fInfo.pitch * bufH());
             }
-            const unsigned i = modeOK(fCurMode) ? (unsigned)fCurMode - 1 : 0;
+            uint32_t cw = fInfo.width, ch = fInfo.height;
+            if (!modeSize(fCurMode, &cw, &ch)) { cw = fInfo.width; ch = fInfo.height; }
             r->kva = (void *)fScanMap->getVirtualAddress();
             /* b87: the scan-out's real physical address (the GPU aperture, contiguous) and size. With phys 0 (copied from
                NMIntelFB) NMXAccel's display pipe could never back the framebuffer resource WindowServer asks for
                (initFramebufferResource -> NULL even with the scan-out gate open), and WindowServer never sent a frame
                (10-19: iop transaction hooks OPEN, zero transactions in three armed runs). */
             {
-                const unsigned long long need = (unsigned long long)fInfo.pitch * fInfo.height;
+                const unsigned long long need = (unsigned long long)fInfo.pitch * bufH();
                 r->phys = fInfo.phys;
                 r->actualSize = (fInfo.size >= need) ? fInfo.size : ((need + 0xfffull) & ~0xfffull);
             }
-            r->width = fModeW[i]; r->height = fModeH[i]; r->pitch = fInfo.pitch;
+            r->width = cw; r->height = ch; r->pitch = fInfo.pitch;
             if (fScanLogs < 4) { fScanLogs++; FBLOG("scanout: accelerator asked - %ux%u pitch %u (mode %d) phys 0x%llx %llu bytes", r->width, r->height, r->pitch, (int)fCurMode, r->phys, r->actualSize); }
             return kIOReturnSuccess;
         }
@@ -911,25 +1138,58 @@ public:
         return kIOReturnSuccess;
     }
     const char *getPixelFormats() override { return IO32BitDirectPixels "\0"; }
-    IOItemCount getDisplayModeCount() override { return fModeCount; }
+    IOItemCount getDisplayModeCount() override { return fModeCount + fNDT; }
     IOReturn getDisplayModes(IODisplayModeID *modes) override {
         for (uint32_t i = 0; i < fModeCount; i++) modes[i] = (IODisplayModeID)(i + 1);
+        for (unsigned i = 0; i < fNDT; i++) modes[fModeCount + i] = (IODisplayModeID)fDT[i].detailedTimingModeID;
         return kIOReturnSuccess;
     }
     IOReturn getInformationForDisplayMode(IODisplayModeID mode, IODisplayModeInformation *info) override {
-        if (!modeOK(mode) || !info) return kIOReturnBadArgument;
+        uint32_t w, h;
+        if (!info || !modeSize(mode, &w, &h)) return kIOReturnBadArgument;
         bzero(info, sizeof(*info));
-        info->nominalWidth = fModeW[mode - 1];
-        info->nominalHeight = fModeH[mode - 1];
+        info->nominalWidth = w;
+        info->nominalHeight = h;
         info->refreshRate = fRefresh16;
         info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag;
-        if (mode == 1) info->flags |= kDisplayModeDefaultFlag | kDisplayModeNativeFlag;
+        /* b274: nvram nmx-hidpi-def=1 puts the default on our first large desktop (2880x1800: looks like 1440x900) */
+        static int defbig = -1; if (defbig < 0) defbig = nvramChar("nmx-hidpi-def") == '1' ? 1 : 0;
+        IODisplayModeID def = 1;
+        if (defbig && fHiDPI) for (uint32_t i = 2; i <= fModeCount; i++) if (ownBig((IODisplayModeID)i)) { def = (IODisplayModeID)i; break; }
+        if (mode == 1) info->flags |= kDisplayModeNativeFlag;
+        if (mode == def) info->flags |= kDisplayModeDefaultFlag;
+        if (fHiDPI) {
+            /* b263: macOS's sizes are scaled desktops (not presets), as NVRMFB marks them; the panel's own mode may be
+               drawn at 2x (HiDPI "looks like" half the panel) - b262 listed no HiDPI size at all */
+            /* b264: only the panel's own mode is offered at 2x - b263 marked every size (and macOS's sizes as
+               not-preset) and then macOS listed nothing but 2560x1600 and 1280x800 HiDPI: the 1x sizes were gone */
+            if (mode == 1) info->flags |= kNMXDisplayModeValidForHiResFlag;
+            if (ownBig(mode)) {   /* b272: our own large desktops - HiDPI only; nvram nmx-hidpi-nat=1 also marks them native */
+                info->flags |= kNMXDisplayModeValidForHiResFlag;
+                static int nat = -1; if (nat < 0) nat = nvramChar("nmx-hidpi-nat") == '1' ? 1 : 0;
+                if (nat) info->flags |= kDisplayModeNativeFlag;
+                /* b273: their 1x versions (a 3360x2100 desktop shrunk to the panel: tiny text) were in System Settings'
+                   short list, and default (11-06); not a preset keeps them out of it. nvram nmx-hidpi-np=0: off */
+                static int np = -1; if (np < 0) np = nvramChar("nmx-hidpi-np") == '0' ? 0 : 1;
+                if (np) info->flags |= kNMXDisplayModeNotPresetFlag;
+            }
+            /* b265: a desktop larger than the panel exists only to be drawn at 2x (HiDPI looks-like half of it) */
+            if (dtIndex(mode) >= 0 && (w > fInfo.width || h > fInfo.height)) {
+                info->flags |= kNMXDisplayModeValidForHiResFlag;
+                /* b271: on a HiDPI display the public mode list (and System Settings) kept only modes carrying
+                   kDisplayModeNativeFlag (11-04 cgmodes: listed n0 0x0280000f and n10 0x02800009, hidden every
+                   0x00a00009) - these desktops are drawn on the panel's own raster, so they are marked native too */
+                static int nonat = -1; if (nonat < 0) nonat = nvramChar("nmx-hidpi-nonative") ? 1 : 0;
+                if (!nonat) info->flags |= kDisplayModeNativeFlag;
+            }
+        }
         return kIOReturnSuccess;
     }
     UInt64 getPixelFormatsForDisplayMode(IODisplayModeID, IOIndex) override { return 0; }
     IOReturn getPixelInformation(IODisplayModeID mode, IOIndex depth, IOPixelAperture aperture,
                                  IOPixelInformation *pi) override {
-        if (!modeOK(mode) || depth != 0 || aperture != kIOFBSystemAperture || !pi) return kIOReturnUnsupportedMode;
+        uint32_t mw, mh;
+        if (!modeSize(mode, &mw, &mh) || depth != 0 || aperture != kIOFBSystemAperture || !pi) return kIOReturnUnsupportedMode;
         bzero(pi, sizeof(*pi));
         pi->bytesPerRow = fInfo.pitch;
         pi->bitsPerPixel = 32;
@@ -940,8 +1200,8 @@ public:
         pi->componentMasks[1] = 0x0000FF00;
         pi->componentMasks[2] = 0x000000FF;
         strlcpy(pi->pixelFormat, IO32BitDirectPixels, sizeof(pi->pixelFormat));
-        pi->activeWidth = fModeW[mode - 1];
-        pi->activeHeight = fModeH[mode - 1];
+        pi->activeWidth = mw;
+        pi->activeHeight = mh;
         return kIOReturnSuccess;
     }
     IOReturn getCurrentDisplayMode(IODisplayModeID *mode, IOIndex *depth) override {
@@ -953,7 +1213,19 @@ public:
         if (!modeOK(mode) || !info) return kIOReturnUnsupportedMode;
         bzero(info, sizeof(*info));
         info->appleTimingID = kIOTimingIDInvalid;
-        if (mode != 1) {   /* a scaled size: the panel's refresh, with the smaller active area */
+        { const int di = dtIndex(mode);   /* b261: one of macOS's timings - handed back as macOS programmed it */
+          if (di >= 0) {
+              info->flags = kIODetailedTimingValid | ((fDT[di].horizontalScaled && fDT[di].verticalScaled) ? kIOScalingInfoValid : 0);
+              info->detailedInfo.v2 = fDT[di]; return kIOReturnSuccess; } }
+        /* b274: macOS took the default away from the panel's mode and gave it to 3360x2100 (11-06 cgmodes: IO flags of id 9
+           0x0280020f, id 1 0x0280000b) - our large desktops were timed as the panel's own raster, the EDID's preferred
+           timing, and macOS marks the mode with that timing as the default (the last one listed). They now carry no
+           detailed timing (shown at 0 Hz like every mode already). nvram nmx-hidpi-bigtime=1: the b272 timing again */
+        if (ownBig(mode)) {
+            static int bt = -1; if (bt < 0) bt = nvramChar("nmx-hidpi-bigtime") == '1' ? 1 : 0;
+            if (!bt) return kIOReturnSuccess;   /* flags 0: no timing known */
+        }
+        if (mode != 1 && !ownBig(mode)) {   /* a scaled size: the panel's refresh, with the smaller active area */
             info->flags = kIODetailedTimingValid;
             IODetailedTimingInformationV2 &s = info->detailedInfo.v2;
             s.pixelClock = s.minPixelClock = s.maxPixelClock = (uint64_t)fInfo.pclk_khz * 1000;
@@ -976,13 +1248,19 @@ public:
         d.verticalSyncOffset = t.vsync_start > t.height ? t.vsync_start - t.height : 0;
         d.verticalSyncPulseWidth = t.vsync_end > t.vsync_start ? t.vsync_end - t.vsync_start : 0;
         info->flags = kIODetailedTimingValid;
+        if (mode != 1) {   /* b272: a large desktop on the panel's own raster, as macOS programs its scaled timings */
+            d.horizontalScaled = fModeW[mode - 1]; d.verticalScaled = fModeH[mode - 1];
+            info->flags |= kIOScalingInfoValid;
+        }
         return kIOReturnSuccess;
     }
     IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override {
-        if (!modeOK(mode) || depth != 0) return kIOReturnUnsupported;
+        uint32_t w, h;
+        if (!modeSize(mode, &w, &h) || depth != 0) return kIOReturnUnsupported;
         if (mode == fCurMode) return kIOReturnSuccess;
-        int err = nmx_fb_set_size(fDev, mode == 1 ? 0 : fModeW[mode - 1], mode == 1 ? 0 : fModeH[mode - 1]);
-        FBLOG("display mode %d (%ux%u) -> %d", (int)mode, fModeW[mode - 1], fModeH[mode - 1], err);
+        const bool native = w == fInfo.width && h == fInfo.height;
+        int err = nmx_fb_set_size(fDev, native ? 0 : w, native ? 0 : h);
+        FBLOG("display mode 0x%x (%ux%u%s) -> %d", (unsigned)mode, w, h, dtIndex(mode) >= 0 ? ", macOS timing" : "", err);
         if (err) return kIOReturnUnsupportedMode;
         fCurMode = mode;
         return kIOReturnSuccess;
@@ -1042,6 +1320,18 @@ public:
        (10-22) WindowServer logs "Display sleep not yet completed, defer ack of IOPM sleep", the system sleep waits 30 s
        for WindowServer and any touch in that time turns the sleep into a DarkWake. Read at every power change, so
        sudo nvram nmx-fbpm=1 / sudo nvram -d nmx-fbpm switch it without a restart. */
+    /* b261: NVRAM switch read once (sudo nvram nmx-hidpi=1 / sudo nvram -d nmx-hidpi, then restart) */
+    static char nvramChar(const char *name) {   /* first byte of an NVRAM variable, 0 when it is not set */
+        char c = 0;
+        IORegistryEntry *e = IORegistryEntry::fromPath("/options", gIODTPlane);
+        if (IODTNVRAM *n = OSDynamicCast(IODTNVRAM, e)) {
+            OSObject *o = n->copyProperty(name);
+            if (OSData *d = OSDynamicCast(OSData, o)) { if (d->getLength() >= 1) c = *(const char *)d->getBytesNoCopy(); }
+            OSSafeReleaseNULL(o);
+        }
+        if (e) e->release();
+        return c;
+    }
     static bool fbPmOn() {
         bool on = true;     /* b133: ON by default (10-22: sleep + wake work every time); NVRAM nmx-fbpm=0 turns it off */
         IORegistryEntry *e = IORegistryEntry::fromPath("/options", gIODTPlane);
@@ -1139,6 +1429,19 @@ public:
         case kConnectionColorModesSupported: case kConnectionColorMode: *value = 0x00000001; return kIOReturnSuccess;
         case kConnectionColorDepthsSupported: case kConnectionControllerColorDepth: case kConnectionControllerDepthsSupported:
             *value = 0x00000002; return kIOReturnSuccess;
+        case kConnectionSupportsHLDDCSense:
+            /* b268: IOGraphics reads the EDID (getDDCBlock) only when this says yes - b267 had the panel's EDID ready but
+               the display stayed "unkn" (NVRMFB answers the same way) */
+            { static int said; if (said++ < 4) FBLOG("hidpi: HLDDCSense asked -> %s (EDID %u bytes)", fEdidSize >= 128 ? "yes" : "no", fEdidSize); }
+            return fEdidSize >= 128 ? kIOReturnSuccess : kIOReturnUnsupported;
+        case kConnectionSupportsAppleSense: case kConnectionSupportsLLDDCSense:
+            /* b269: b268 was never asked for the EDID - IODisplay took the Apple sense (generic LCD, b134) as the display's
+               identity ("unkn"/0x717). With an EDID, the sense is said to be unsupported (as NVRMFB does), so the display
+               is identified by the EDID; AppleBacklightDisplay still matches through getAppleSense (brightness) */
+            { static int said; if (said++ < 4) FBLOG("hidpi: %s asked -> %s", attr == kConnectionSupportsAppleSense ? "AppleSense" : "LLDDCSense",
+                                                     fEdidSize >= 128 ? "unsupported (EDID instead)" : "base class"); }
+            if (fEdidSize >= 128) return kIOReturnUnsupported;
+            return IOFramebuffer::getAttributeForConnection(idx, attr, value);
         default: return IOFramebuffer::getAttributeForConnection(idx, attr, value);
         }
     }
@@ -1235,6 +1538,19 @@ extern "C" int nmx_boot_snapshot_paint(void *va, uint32_t pitch, uint32_t width,
     return 1;
 }
 
+/* b265: first byte of an NVRAM variable, 0 when it is not set */
+static char nmx_nvram_char(const char *name)
+{
+    char c = 0;
+    IORegistryEntry *e = IORegistryEntry::fromPath("/options", gIODTPlane);
+    if (IODTNVRAM *n = OSDynamicCast(IODTNVRAM, e)) {
+        OSObject *o = n->copyProperty(name);
+        if (OSData *d = OSDynamicCast(OSData, o)) { if (d->getLength() >= 1) c = *(const char *)d->getBytesNoCopy(); }
+        OSSafeReleaseNULL(o);
+    }
+    if (e) e->release();
+    return c;
+}
 /* lights the device's outputs and publishes them under 'gpu'; nullptr when there is nothing to show (reason logged) */
 IOService *nmx_fb_publish(IOService *gpu, void *dev)
 {
@@ -1245,6 +1561,16 @@ IOService *nmx_fb_publish(IOService *gpu, void *dev)
     nmx_fb_psr_wanted = PE_parse_boot_argn("-nmxnopsr", nullptr, 0) ? 0 : 1;
     /* b180: external displays (HDMI / USB-C) mirror the panel; -nmxnoext keeps them dark */
     nmx_fb_ext_wanted = PE_parse_boot_argn("-nmxnoext", nullptr, 0) ? 0 : 1;
+    /* b265: HiDPI step 2 - scan-out buffers larger than the panel; opt-in: nvram nmx-hidpi2=1 or boot-arg nmxhidpi2=1
+       (and HiDPI itself not switched off with nmx-hidpi=0) */
+    {
+        int v = 0; const bool arg = PE_parse_boot_argn("nmxhidpi2", &v, sizeof v);
+        const char nv2 = nmx_nvram_char("nmx-hidpi2"), nv1 = nmx_nvram_char("nmx-hidpi");
+        int a1 = 1; const bool arg1 = PE_parse_boot_argn("nmxhidpi", &a1, sizeof a1);
+        const bool hidpi = arg1 ? a1 != 0 : nv1 != '0';
+        nmx_fb_big_wanted = hidpi && (arg ? v != 0 : nv2 == '1');
+        FBLOG("hidpi: step 2 (larger scan-out buffers) %s", nmx_fb_big_wanted ? "ON (nmx-hidpi2=1)" : "off");
+    }
     int err = nmx_fb_open(dev, &info);
     nmx_step(err || !info.ok ? "publish: framebuffer open FAILED" : "publish: framebuffer open ok");
     if (err || !info.ok) {

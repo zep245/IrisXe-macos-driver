@@ -50,6 +50,7 @@ struct nmx_fb {
     struct nmx_fb_info info;
     /* 10-18 (Retina sizes): a smaller desktop shown full-screen by the display engine's panel fitter */
     uint32_t cur_w, cur_h;              /* the size macOS draws at (0 = native) */
+    uint32_t bw, bh;                    /* b265: the scan-out buffers' size (>= the panel; larger for HiDPI step 2) */
     struct drm_framebuffer *scaled;     /* the scan-out buffer seen as cur_w x cur_h (same memory, same pitch) */
     /* b94: hardware cursor - two ARGB8888 images on the cursor plane; what macOS asked for is kept so it can be put
        back after any mode set (drm_client_modeset_commit turns every non-primary plane off) */
@@ -92,6 +93,13 @@ struct nmx_fb {
 
 /* b164: set by the kext before nmx_fb_open (boot-arg -nmxnodefer = 0: commit at once, as before) */
 int nmx_fb_defer_wanted = 1;
+int nmx_fb_big_wanted = 0;
+/* b265: a desktop larger than the panel (HiDPI "looks like 1440x900" = 2880x1800 on 2560x1600) is shrunk to the panel
+   by the primary plane's scaler: the panel keeps its native mode, the plane reads cur_w x cur_h of the buffer */
+static int fb_big(const struct nmx_fb *fb)
+{
+    return fb->cur_w && fb->cur_h && (fb->cur_w > fb->info.width || fb->cur_h > fb->info.height);
+}
 /* b170: panel self refresh once frames flip (boot-arg -nmxnopsr = 0: never) */
 int nmx_fb_psr_wanted = 1;
 int nmx_i915_psr(struct drm_device *drm, int on);
@@ -255,7 +263,25 @@ static void bridge_point_outputs(struct nmx_fb *fb)
 }
 
 /* b180: commit the outputs; if that fails while an external is lit, commit again with the panel alone */
+static int flip_commit_to(struct nmx_fb *fb, int target, int nonblock);
+static int bridge_commit_modes(struct nmx_fb *fb, const char *why);
+/* b265: a mode set puts the primary plane 1:1 (drm_client); a desktop larger than the panel is shrunk by the plane
+   scaler again right after it (one more commit of the primary plane) */
 static int bridge_commit(struct nmx_fb *fb, const char *why)
+{
+    int err = bridge_commit_modes(fb, why);
+    if (err == 0 && fb_big(fb)) {
+        int e2 = flip_commit_to(fb, fb->front, 0);
+        static int said;
+        if (said++ < 8)
+            printf("NullMoth display: %s: desktop %ux%u shrunk to the panel %ux%u by the plane scaler -> %d\n", why, fb->cur_w,
+                   fb->cur_h, fb->info.width, fb->info.height, e2);
+        if (e2)
+            err = e2 > 0 ? -e2 : e2;
+    }
+    return err;
+}
+static int bridge_commit_modes(struct nmx_fb *fb, const char *why)
 {
     int err = drm_client_modeset_commit(&fb->client);
     if (err == 0)
@@ -305,7 +331,7 @@ int nmx_fb_set_size(void *dev, uint32_t w, uint32_t h)
             fb = fbs[i].fb;
     if (fb == NULL || fb->buffer == NULL)
         return ENODEV;
-    if (w > fb->info.width || h > fb->info.height || (w && w < 640) || (h && h < 400))
+    if (w > fb->bw || h > fb->bh || (w && w < 640) || (h && h < 400))
         return EINVAL;
     if (w == fb->info.width && h == fb->info.height)
         w = h = 0;
@@ -316,7 +342,7 @@ int nmx_fb_set_size(void *dev, uint32_t w, uint32_t h)
     if (fb->scaled2) { drm_mode_rmfb(drm, fb->scaled2->base.id, fb->client.file); fb->scaled2 = NULL; }
     mutex_unlock(&fb->flip_lock);
     struct drm_framebuffer *old = fb->scaled, *nfb = NULL;
-    if (w) {
+    if (w && w <= fb->info.width && h <= fb->info.height) {   /* b265: a larger desktop needs no view (whole buffer) */
         u32 handle = 0;
         struct drm_mode_fb_cmd2 req;
         int err = -drm_gem_handle_create(fb->client.file, fb->buffer->gem, &handle);
@@ -361,7 +387,7 @@ int nmx_fb_set_size(void *dev, uint32_t w, uint32_t h)
             if (fb->mapped) {
                 char *va = fb->map.is_iomem ? (char *)fb->map.vaddr_iomem : (char *)fb->map.vaddr;
                 if (va) {
-                    memset(va, 0, (size_t)fb->info.pitch * fb->info.height);
+                    memset(va, 0, (size_t)fb->info.pitch * fb->bh);
                     printf("NullMoth display: desktop size change to %ux%u - buffer 0 cleared (no picture in the old layout)\n",
                            w ? w : fb->info.width, h ? h : fb->info.height);
                 }
@@ -515,39 +541,59 @@ int nmx_fb_open(void *devp, struct nmx_fb_info *out)
         goto fail;
     }
 
-    fb->buffer = drm_client_framebuffer_create(&fb->client, out->width, out->height, DRM_FORMAT_XRGB8888);
-    if (IS_ERR(fb->buffer)) {
-        err = -PTR_ERR(fb->buffer);
-        fb->buffer = NULL;
-        printf("NullMoth display: no %ux%u scan-out buffer (%d)\n", out->width, out->height, err);
-        goto fail;
-    }
-    out->pitch = fb->buffer->fb->pitches[0];
-
-    printf("NullMoth display: scan-out buffer %ux%u created, pitch %u; mapping it\n", out->width, out->height, out->pitch);
-    err = -drm_client_buffer_vmap(fb->buffer, &fb->map);
-    if (err) {
-        printf("NullMoth display: the scan-out buffer would not map (%d)\n", err);
-        goto fail;
-    }
-    fb->mapped = 1;
-
-    /* the published range must be one physical run: check every page of the CPU view */
-    const char *va = fb->map.is_iomem ? (const char *)fb->map.vaddr_iomem : (const char *)fb->map.vaddr;
-    uint64_t size = (uint64_t)out->pitch * out->height;
-    uint64_t base = nmx_xnu_kva_to_phys(va);
-    for (uint64_t off = PAGE_SIZE; off < size; off += PAGE_SIZE)
-        if (nmx_xnu_kva_to_phys(va + off) != base + off) {
-            printf("NullMoth display: the scan-out buffer is not physically contiguous (page %llu)\n",
-                   (unsigned long long)(off / PAGE_SIZE));
-            err = EFAULT;
-            goto fail;
+    /* b265: with HiDPI step 2 the scan-out buffers are up to 21/16 of the panel (2560x1600 -> 3360x2100, at most
+       3840 wide) so macOS can draw a desktop larger than the panel; anything that does not work out (no memory, not one
+       physical run) falls back to the panel's size, as before */
+    const char *va = NULL;
+    uint64_t size = 0;
+    for (int attempt = nmx_fb_big_wanted ? 0 : 1; attempt < 2; attempt++) {
+        uint32_t bw = out->width, bh = out->height;
+        if (attempt == 0) {
+            bw = out->width * 21 / 16; bh = out->height * 21 / 16;
+            if (bw > 3840) { bh = (uint32_t)((uint64_t)bh * 3840 / bw); bw = 3840; }
+            bw &= ~7u; bh &= ~1u;
         }
-    if (base == 0) {
-        err = EFAULT;
-        goto fail;
+        fb->buffer = drm_client_framebuffer_create(&fb->client, bw, bh, DRM_FORMAT_XRGB8888);
+        if (IS_ERR(fb->buffer)) {
+            err = -PTR_ERR(fb->buffer);
+            fb->buffer = NULL;
+            printf("NullMoth display: no %ux%u scan-out buffer (%d)%s\n", bw, bh, err, attempt ? "" : " - trying the panel's size");
+            if (attempt) goto fail;
+            continue;
+        }
+        out->pitch = fb->buffer->fb->pitches[0];
+        printf("NullMoth display: scan-out buffer %ux%u created, pitch %u; mapping it\n", bw, bh, out->pitch);
+        err = -drm_client_buffer_vmap(fb->buffer, &fb->map);
+        int ok = !err;
+        if (err)
+            printf("NullMoth display: the scan-out buffer would not map (%d)\n", err);
+        else {
+            fb->mapped = 1;
+            /* the published range must be one physical run: check every page of the CPU view */
+            va = fb->map.is_iomem ? (const char *)fb->map.vaddr_iomem : (const char *)fb->map.vaddr;
+            size = (uint64_t)out->pitch * bh;
+            uint64_t base = nmx_xnu_kva_to_phys(va);
+            for (uint64_t off = PAGE_SIZE; ok && off < size; off += PAGE_SIZE)
+                if (nmx_xnu_kva_to_phys(va + off) != base + off) {
+                    printf("NullMoth display: the scan-out buffer is not physically contiguous (page %llu)\n",
+                           (unsigned long long)(off / PAGE_SIZE));
+                    ok = 0;
+                }
+            if (base == 0)
+                ok = 0;
+            out->phys = base;
+        }
+        if (!ok) {
+            if (fb->mapped) { drm_client_buffer_vunmap(fb->buffer); fb->mapped = 0; }
+            drm_client_framebuffer_delete(fb->buffer); fb->buffer = NULL;
+            if (attempt) { err = err ? err : EFAULT; goto fail; }
+            printf("NullMoth display: the %ux%u buffer did not work out - the panel's size instead\n", bw, bh);
+            continue;
+        }
+        fb->bw = bw; fb->bh = bh;
+        out->buf_w = bw; out->buf_h = bh;
+        break;
     }
-    out->phys = base;
     out->size = round_page(size);
     out->kva = (uint64_t)(uintptr_t)va;
     /* the firmware's last boot screen (snapshot taken before i915 took the GPU), else black, until WindowServer draws */
@@ -626,6 +672,10 @@ int nmx_fb_power(void *dev, int on)
             r = -drm_client_modeset_dpms(&fbs[i].fb->client, on ? DRM_MODE_DPMS_ON : DRM_MODE_DPMS_OFF);
             nmx_step("bridge: DPMS commit returned");
             if (on) {
+                if (!r && fb_big(fbs[i].fb)) {   /* b265: the DPMS commit put the plane 1:1 - shrink the larger desktop again */
+                    int e2 = flip_commit_to(fbs[i].fb, fbs[i].fb->front, 0);
+                    if (e2) printf("NullMoth display: display on: plane scaler for %ux%u -> %d\n", fbs[i].fb->cur_w, fbs[i].fb->cur_h, e2);
+                }
                 cursor_reapply(fbs[i].fb);
                 bridge_poll_outputs(fbs[i].fb, "display on");   /* a resume may have switched polling off */
             }
@@ -719,6 +769,33 @@ static struct nmx_fb *fb_of(void *dev)
     return NULL;
 }
 
+/* b267: the panel's EDID (i915 read it over the eDP AUX channel when it probed the connector) */
+int nmx_fb_edid(void *dev, uint8_t *buf, uint32_t max)
+{
+    struct nmx_fb *fb = fb_of(dev);
+    if (fb == NULL || buf == NULL || max < 128)
+        return 0;
+    struct drm_device *drm = fb->client.dev;
+    struct drm_mode_set *ms;
+    int len = 0;
+    mutex_lock(&fb->client.modeset_mutex);
+    mutex_lock(&drm->mode_config.mutex);
+    drm_client_for_each_modeset(ms, &fb->client) {
+        if (!ms_internal(ms))
+            continue;
+        struct drm_property_blob *b = ms->connectors[0]->edid_blob_ptr;
+        if (b != NULL && b->length >= 128) {
+            len = (int)(b->length < max ? b->length : max);
+            len -= len % 128;
+            memcpy(buf, b->data, (size_t)len);
+        }
+        break;
+    }
+    mutex_unlock(&drm->mode_config.mutex);
+    mutex_unlock(&fb->client.modeset_mutex);
+    return len;
+}
+
 /* b164: the deferred first mode set: our scan-out buffer goes on the panel now */
 static int bridge_go(struct nmx_fb *fb, const char *why)
 {
@@ -738,7 +815,7 @@ static int bridge_go(struct nmx_fb *fb, const char *why)
         (fb->cur_w != fb->info.width || fb->cur_h != fb->info.height)) {
         char *va = fb->map.is_iomem ? (char *)fb->map.vaddr_iomem : (char *)fb->map.vaddr;
         if (va) {
-            memset(va, 0, (size_t)fb->info.pitch * fb->info.height);
+            memset(va, 0, (size_t)fb->info.pitch * fb->bh);
             printf("NullMoth display: hand-over: scaled desktop %ux%u on a %ux%u panel - buffer 0 cleared (no stale boot logo)\n",
                    fb->cur_w, fb->cur_h, fb->info.width, fb->info.height);
         }
@@ -845,6 +922,11 @@ call:
         if (ms->mode == NULL || ms->crtc == NULL)
             continue;
         req.crtc_id = ms->crtc->base.id;
+        if (img >= 0 && fb_big(fb) && ms_internal(ms) && ms->mode != NULL) {
+            /* b265: desktop coordinates -> panel coordinates (the picture is shrunk, the pointer image is not) */
+            req.x = (int32_t)((int64_t)x * ms->mode->hdisplay / (int64_t)fb->cur_w);
+            req.y = (int32_t)((int64_t)y * ms->mode->vdisplay / (int64_t)fb->cur_h);
+        } else if (img >= 0) { req.x = x; req.y = y; }
         int r = -drm_mode_cursor2_ioctl(drm, &req, fb->client.file);
         outputs++;
         if (r && !err)
@@ -998,15 +1080,15 @@ static void flip_wait_locked(struct nmx_fb *fb)
 static int flip_ready_locked(struct nmx_fb *fb)
 {
     if (fb->buf2 == NULL) {
-        struct drm_client_buffer *b = drm_client_framebuffer_create(&fb->client, fb->info.width, fb->info.height, DRM_FORMAT_XRGB8888);
-        if (IS_ERR(b)) { printf("NullMoth display: flip: no second %ux%u buffer (%ld)\n", fb->info.width, fb->info.height, PTR_ERR(b)); return ENOMEM; }
+        struct drm_client_buffer *b = drm_client_framebuffer_create(&fb->client, fb->bw, fb->bh, DRM_FORMAT_XRGB8888);
+        if (IS_ERR(b)) { printf("NullMoth display: flip: no second %ux%u buffer (%ld)\n", fb->bw, fb->bh, PTR_ERR(b)); return ENOMEM; }
         if (b->fb->pitches[0] != fb->info.pitch || drm_client_buffer_vmap(b, &fb->map2) != 0) {
             printf("NullMoth display: flip: second buffer pitch %u (need %u) or no mapping\n", b->fb->pitches[0], fb->info.pitch);
             drm_client_framebuffer_delete(b); return EINVAL; }
         fb->buf2 = b; fb->mapped2 = 1;
         char *va = fb->map2.is_iomem ? (char *)fb->map2.vaddr_iomem : (char *)fb->map2.vaddr;
-        memset(va, 0, (size_t)fb->info.pitch * fb->info.height);
-        printf("NullMoth display: flip: second scan-out buffer %ux%u ready (double buffering)\n", fb->info.width, fb->info.height);
+        memset(va, 0, (size_t)fb->info.pitch * fb->bh);
+        printf("NullMoth display: flip: second scan-out buffer %ux%u ready (double buffering)\n", fb->bw, fb->bh);
     }
     if (fb->cur_w && fb->cur_h && fb->scaled2 == NULL) {
         fb->scaled2 = flip_view(fb, fb->buf2->gem, fb->cur_w, fb->cur_h);
@@ -1061,6 +1143,13 @@ retry:
         if (ps->crtc == NULL) continue;             /* plane not lit on this output */
         struct drm_framebuffer *nfb = ms_view(fb, ms, target);   /* b180: per output (panel scaled, external 1:1) */
         drm_atomic_set_fb_for_plane(ps, nfb);
+        if (ms_internal(ms)) {
+            /* b265: the panel shows cur_w x cur_h of the buffer shrunk to its mode (plane scaler); otherwise 1:1 */
+            const int big = fb_big(fb);
+            const uint32_t sw = big ? fb->cur_w : (uint32_t)ms->mode->hdisplay, sh = big ? fb->cur_h : (uint32_t)ms->mode->vdisplay;
+            ps->src_x = 0; ps->src_y = 0; ps->src_w = sw << 16; ps->src_h = sh << 16;
+            ps->crtc_x = 0; ps->crtc_y = 0; ps->crtc_w = ms->mode->hdisplay; ps->crtc_h = ms->mode->vdisplay;
+        }
         ms->fb = nfb;                               /* later mode sets (hotplug, DPMS) keep this buffer */
         planes++;
     }
