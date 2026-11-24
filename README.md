@@ -185,7 +185,7 @@ Files in `/Library/GPUBundles/` (read at run time, no rebuild):
 
 | File | Effect |
 |---|---|
-| `nvmtl-allow.txt` | Apps allowed to use the GPU, one `!Name` per line |
+| `nvmtl-allow.txt` | Apps allowed to use the GPU, one `!Name` per line. For Brave add `!Brave Browser` and `!Brave Browser Helper (GPU)` (also covers Brave 157's new "Aperitif" GPU process) |
 | `nvmtl-ciflip` | Apps whose Core Image output is flipped (default: Photo Booth; an empty file turns it off) |
 | `nvmtl-standincopy` | Old copy mode for small image uploads (causes stale text - diagnostic only) |
 | `nmx-autoarm-slow` / `nmx-autoarm-fast` | Slower / faster acceleration helper timings |
@@ -210,6 +210,7 @@ Files in `/Library/GPUBundles/` (read at run time, no rebuild):
 | `nmx-speed.sh` | CPU time of WindowServer, logd, iconservicesagent and others over a minute, driver log lines, quiet / verbose plugin |
 | `nmx-icontest.sh` | Tahoe icon test: `on`, `collect`, `off` |
 | `nmx-hidpi.sh` | `big`: the larger HiDPI sizes (1440 x 900, 1600 x 1000, 1680 x 1050); `nobig`: back to 1280 x 800 HiDPI only; `off`: no HiDPI; `status` |
+| `nmx-powertest.sh` | Battery power (W) and WindowServer / Brave CPU at each HiDPI size; `video` measures a video playing in Brave (charger unplugged) |
 
 Driver log: `log show --last boot --predicate 'eventMessage contains "NullMoth"'`.
 

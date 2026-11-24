@@ -1,5 +1,7 @@
 # Loading the driver from OpenCore - design (2026-10-26)
 
+**Status 2026-11-06: not possible as planned (see Constraints 1). U1 (built-in firmware) stays; U2-U4 are stopped.**
+
 Goal: OpenCore loads the GPU driver at boot (Kernel -> Add), from the EFI partition or a USB stick, instead of macOS
 loading it from `/Library/Extensions`.
 
@@ -17,7 +19,10 @@ loading it from `/Library/Extensions`.
 
 1. **OpenCore can only add kexts to the boot kernel collection.** Every library a kext lists in `OSBundleLibraries`
    must itself be in the boot collection.
-   - NMXGPU needs `kpi.*`, IOPCIFamily, IOACPIFamily, IOGraphicsFamily: all boot-collection kexts. **Injectable.**
+   - NMXGPU needs `kpi.*`, IOPCIFamily, IOACPIFamily, IOGraphicsFamily. **2026-11-06 (nmx-bootkc-check.sh, Sequoia
+     15.8.1): IOGraphicsFamily is in the SYSTEM collection, not the boot one - NMXGPU (an IOFramebuffer) cannot be
+     injected.** IOPCIFamily, IOACPIFamily and IOSurface are in the boot collection; IOAcceleratorFamily2,
+     AppleGraphicsDevicePolicy and AppleGraphicsControl are in the system collection.
    - NMXAccel needs IOAcceleratorFamily2 and IOSurface. Whether those are in the boot collection is **unknown** -
      `tools/macos-helpers/nmx-bootkc-check.sh` answers it on the real machine (Sequoia and Tahoe).
 2. **No file system at attach time.** The root volume is mounted later. Everything NMXGPU reads at attach must come

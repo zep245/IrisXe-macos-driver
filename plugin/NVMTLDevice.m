@@ -16,6 +16,7 @@
 #include <os/log.h>
 #include <os/lock.h>
 #include <unistd.h>
+#include <errno.h>
 #include <stdint.h>
 #include <vulkan/vulkan_core.h>
 #include <pthread.h>
@@ -115,6 +116,16 @@ void nvlog(const char *fmt, ...) {
     if (rep) snprintf(t, sizeof t, "%s   [logged %llu times now]", b, (unsigned long long)rep);
     else     snprintf(t, sizeof t, "%s", b);
 #if NVMTL_RELEASE
+    /* b275: /Library/GPUBundles/nvmtl-trace (sudo touch) = every line, in every process, to the log and to
+       /tmp/nmx-mtltrace.log (a sandboxed process cannot write that file; start Brave with --disable-gpu-sandbox) */
+    static int tr = -1; if (tr < 0) tr = access("/Library/GPUBundles/nvmtl-trace", F_OK) == 0 &&
+                                     !(getprogname() && !strcmp(getprogname(), "WindowServer"));   /* not the desktop: every frame */
+    if (tr) {
+        os_log_error(OS_LOG_DEFAULT, "NullMoth trace: %{public}s", t);
+        FILE *tf = fopen("/tmp/nmx-mtltrace.log", "a");
+        if (tf) { fprintf(tf, "%s[%d]: %s\n", getprogname(), getpid(), t); fclose(tf); }
+        return;
+    }
     /* b252: os_log - Chromium's GPU sandbox refuses the syslog socket, so Brave's GPU process logged nothing (11-02) */
     if (nvmtl_log_failure(t)) {
         os_log_error(OS_LOG_DEFAULT, "NullMoth: %{public}s", t);
@@ -198,7 +209,15 @@ static nvk_queue *nvmtl_device_queue(void) {
 static bool nvmtl_accel_armed(void)
 {
     int v = 0; size_t n = sizeof v;
-    if (sysctlbyname("debug.nvaccelfb", &v, &n, NULL, 0) != 0) return false;
+    if (sysctlbyname("debug.nvaccelfb", &v, &n, NULL, 0) != 0) {
+        /* b276: Brave 157's GPU sandbox refuses this sysctl (EPERM), so "!" lines turned its GPU process away (11-07).
+           A sandbox that refuses it is not a reason to deny: this process already has the accelerator's port. */
+        if (errno == EPERM || errno == EACCES) {
+            static int said; if (!said++) nvlog("debug.nvaccelfb refused here (sandbox) - taken as armed");
+            return true;
+        }
+        return false;
+    }
     return v != 0;
 }
 #include <dlfcn.h>
@@ -347,6 +366,32 @@ static void nvmtl_nvenc_hevc_register(void)
               st ? "NOT registered" : "REGISTERED", me, (int)st, path);
     });
 }
+/* b275: with the trace switch, shows that the plugin was loaded into a process at all */
+__attribute__((constructor)) static void nvmtl_trace_loaded(void)
+{
+    nvlog("plugin loaded into %s (pid %d)", getprogname() ? getprogname() : "?", getpid());
+}
+/* b276: Chromium 157 starts every helper from one "<App> Helper (Aperitif)" program (11-07: Brave's GPU process,
+   network and storage helpers all report "Brave Browser Helper (Aperitif)"). Its GPU process carries --type=gpu-process;
+   it also matches the list lines "<App> Helper (GPU)" and "<App> Helper (Aperitif GPU)", so the list keeps working. */
+#include <crt_externs.h>
+static int nvmtl_is_gpu_process(void)
+{
+    char **av = *_NSGetArgv(); int ac = *_NSGetArgc();
+    for (int i = 1; i < ac && av && av[i]; i++) if (!strcmp(av[i], "--type=gpu-process")) return 1;
+    return 0;
+}
+static int nvmtl_name_matches(const char *entry, const char *me)
+{
+    if (!strcmp(entry, me)) return 1;
+    static const char ap[] = " Helper (Aperitif)";
+    size_t ml = strlen(me), al = sizeof ap - 1;
+    if (ml <= al || strcmp(me + ml - al, ap) || !nvmtl_is_gpu_process()) return 0;
+    char alt[300];
+    snprintf(alt, sizeof alt, "%.*s Helper (GPU)", (int)(ml - al), me);          if (!strcmp(entry, alt)) return 1;
+    snprintf(alt, sizeof alt, "%.*s Helper (Aperitif GPU)", (int)(ml - al), me); if (!strcmp(entry, alt)) return 1;
+    return 0;
+}
 static bool nvmtl_process_is_allowed(void)
 {
     const char *me = getprogname();
@@ -375,15 +420,17 @@ static bool nvmtl_process_is_allowed(void)
         if (*p == '-') { p++; while (*p == ' ' || *p == '\t') p++; if (!strcmp(p, me)) { nvlog("  denied by list: no device for %s", me); fclose(f); return false; } continue; }
         bool armedOnly = false;
         if (*p == '!') { armedOnly = true; p++; while (*p == ' ' || *p == '\t') p++; }
-        if (strcmp(p, "*") && strcmp(p, me)) continue;
+        if (strcmp(p, "*") && !nvmtl_name_matches(p, me)) continue;
         if (armedOnly && !nvmtl_accel_armed()) {
             nvlog("  '%s' is armed-only and debug.nvaccelfb reads 0 -- no device (arm it with sysctl -w debug.nvaccelfb=1)", me);
-            break;
+            fclose(f); return false;
         }
         ok = true; break;
     }
     fclose(f);
     if (ok) nvlog("  allow-listed: %s", me);
+    /* b275: say so - Brave 157 renamed its GPU process ("Brave Browser Helper (Aperitif GPU)") and was silently refused */
+    else nvlog("  '%s' is not in nvmtl-allow.txt: no device", me);
     return ok;
 }
 
